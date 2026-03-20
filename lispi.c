@@ -14,9 +14,34 @@
 
 typedef uint8_t   u8;
 typedef int32_t   i32;
+typedef i32       b32;
 typedef size_t    isize;
 typedef ptrdiff_t usize;
 typedef uintptr_t uintptr;
+
+#define false 0
+#define true 1
+
+typedef struct String {
+    u8 const *data;
+    isize     len;
+} String;
+
+#define STR(...) (String){ .data = cast(u8 const*)(__VA_ARGS__), .len = sizeof(__VA_ARGS__) }
+
+b32 string_eq(String a, String b) {
+    if (a.len != b.len) {
+        return false;
+    }
+
+    for (isize i = 0; i < a.len; i++) {
+        if (a.data[i] != b.data[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 typedef struct Arena_Block {
     struct Arena_Block *next;
@@ -50,7 +75,7 @@ void *arena_block_alloc_align(Arena_Block *block, isize size, usize align) {
     }
 
     block->len += padding;
-    void *data  = cast(void*)(cast(uintptr)block->memory) + block->len;
+    void *data  = cast(void*)((cast(uintptr)block->memory) + block->len);
     block->len += size;
     return data;
 }
@@ -64,7 +89,7 @@ Arena_Block *arena_block_new(usize size) {
     if (!block) {
         fatalf("OOM\n");
     }
-    block->memory = cast(void*) (cast(uintptr)block) + sizeof(Arena_Block);
+    block->memory = cast(void*)((cast(uintptr)block) + sizeof(Arena_Block));
     block->cap    = size;
     return block;
 }
@@ -197,6 +222,7 @@ Arena *temp_arena_get(Arena **collisions, isize collision_count) {
 typedef struct Context {
     Arena        symbol_strings;
     Arena        things;
+    struct Thing *symbols; // list of symbols, should probably be turned into a hash map at some point
     struct Thing *dead_things;
 
     struct Thing *nil;
@@ -221,10 +247,7 @@ typedef struct Thing {
             struct Thing *car;
             struct Thing *cdr;
         } cons;
-        struct {
-            u8    *name;
-            isize name_len;
-        } symbol;
+        String symbol;
         struct Thing *next_dead;
     };
 } Thing;
@@ -256,13 +279,25 @@ Thing *thing_cons(Context *ctx, Thing *car, Thing *cdr) {
     return thing;
 }
 
-Thing *thing_symbol(Context *ctx, char const *name) {
-    Thing *thing           = thing_new(ctx, THING_SYMBOL);
-    isize name_len         = strlen(name);
-    thing->symbol.name     = arena_alloc_align(&ctx->symbol_strings, name_len, 1);
-    thing->symbol.name_len = name_len;
-    memcpy(thing->symbol.name, name, name_len);
+Thing *thing_symbol(Context *ctx, String name) {
+    Thing *thing       = thing_new(ctx, THING_SYMBOL);
+    thing->symbol.data = arena_alloc_align(&ctx->symbol_strings, name.len, 1);
+    thing->symbol.len  = name.len;
+    memcpy((u8*)thing->symbol.data, name.data, name.len);
     return thing;
+}
+
+Thing *thing_symbol_intern(Context *ctx, String name) {
+    for (Thing *sym_cons = ctx->symbols; sym_cons != ctx->nil; sym_cons = sym_cons->cons.cdr) {
+        Thing *sym = sym_cons->cons.car;
+        if (string_eq(name, sym->symbol)) {
+            return sym;
+        }
+    }
+
+    Thing *sym = thing_symbol(ctx, name);
+    ctx->symbols = thing_cons(ctx, sym, ctx->symbols);
+    return sym;
 }
 
 void thing_kill(Context *ctx, Thing *thing) {
@@ -284,7 +319,7 @@ void print(Thing *t) {
         printf(")");
         break;
     case THING_SYMBOL:
-        printf(":%.*s", (int)t->symbol.name_len, t->symbol.name);
+        printf(":%.*s", (int)t->symbol.len, t->symbol.data);
         break;
     case THING_NIL:
         printf("nil");
@@ -296,6 +331,199 @@ void print(Thing *t) {
 }
 
 // Parser
+
+typedef enum Token_Type {
+    TOKEN_INVALID,
+    TOKEN_EOF,
+    TOKEN_POPEN,
+    TOKEN_PCLOSE,
+    TOKEN_IDENTIFIER,
+    TOKEN_SYMBOL,
+    TOKEN_NUM,
+} Token_Type;
+
+typedef struct Token {
+    Token_Type type;
+    isize      pos;
+    isize      len;
+} Token;
+
+typedef struct Parser {
+    Context *ctx;
+    String  input;
+
+    isize ch_pos;
+    u8    ch;
+
+    Arena tokens;
+    Token *current_token;
+    Token *peek_token;
+} Parser;
+
+Token *parser_clone_token(Parser *parser, Token token) {
+    Token *cloned = arena_alloc_align(&parser->tokens, sizeof(Token), sizeof(usize));
+    *cloned = token;
+    return cloned;
+}
+
+void parser_read_ch(Parser *parser) {
+    if (parser->ch_pos < parser->input.len) {
+        parser->ch     =  parser->input.data[parser->ch_pos];
+        parser->ch_pos += 1;
+    } else {
+        parser->ch = 0;
+    }
+}
+
+u8 parser_peek_ch(Parser *parser) {
+    if (parser->ch_pos < parser->input.len) {
+        return parser->input.data[parser->ch_pos];
+    }
+    return 0;
+}
+
+b32 is_whitespace_ch(u8 ch) {
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+}
+
+b32 is_reserved_ch(u8 ch) {
+    return ch == '(' || ch == ')' || ch == ':';
+}
+
+b32 is_digit(u8 ch) {
+    return '0' <= ch && ch <= '9';
+}
+
+void parser_skip_whitespace(Parser *parser) {
+    while (is_whitespace_ch(parser->ch)) {
+        parser_read_ch(parser);
+    }
+}
+
+Token *parser_read_symbol(Parser *parser) {
+    Token t = { .type = TOKEN_SYMBOL, .pos = parser->ch_pos - 1 };
+
+    parser_read_ch(parser); // skip ':'
+
+    if(is_digit(parser->ch)) {
+        fatalf("Symbols starting with digits are invalid.");
+    }
+
+    while (!is_reserved_ch(parser->ch) && !is_whitespace_ch(parser->ch)) {
+        parser_read_ch(parser);
+    }
+
+    t.len = parser->ch_pos - t.pos;
+
+    return parser_clone_token(parser, t);
+}
+
+Token *parser_read_identifier(Parser *parser) {
+    Token t = { .type = TOKEN_IDENTIFIER, .pos = parser->ch_pos - 1 };
+
+    while (!is_reserved_ch(parser->ch) && !is_whitespace_ch(parser->ch)) {
+        parser_read_ch(parser);
+    }
+
+    t.len = parser->ch_pos - 1 - t.pos;
+
+    return parser_clone_token(parser, t);
+}
+
+Token *parser_read_num(Parser *parser) {
+    Token t = { .type = TOKEN_NUM, .pos = parser->ch_pos - 1 };
+
+    while (is_digit(parser->ch)) {
+        parser_read_ch(parser);
+    }
+
+    t.len = parser->ch_pos - 1 - t.pos;
+
+    return parser_clone_token(parser, t);
+}
+
+Token *parser_read_token(Parser *parser) {
+    parser_skip_whitespace(parser);
+    Token t = { .pos = parser->ch_pos - 1, .len = 1 };
+
+    switch (parser->ch) {
+    case 0:   t.type = TOKEN_EOF; break;
+    case '(': t.type = TOKEN_POPEN; break;
+    case ')': t.type = TOKEN_PCLOSE; break;
+    case ':': {
+        return parser_read_symbol(parser);
+    }
+    default: {
+        if (is_digit(parser->ch)) {
+            return parser_read_num(parser);
+        }
+        return parser_read_identifier(parser);
+    }
+    }
+
+    parser_read_ch(parser);
+    return parser_clone_token(parser, t);
+}
+
+void parser_next_token(Parser *parser) {
+    parser->current_token = parser->peek_token;
+    parser->peek_token = parser_read_token(parser);
+}
+
+void parser_init(Parser *parser, Context *ctx, String input) {
+    parser->ctx   = ctx;
+    parser->input = input;
+    parser_read_ch(parser);
+    parser_next_token(parser);
+    parser_next_token(parser);
+}
+
+Thing *parser_read(Parser *parser) {
+    switch (parser->current_token->type) {
+    case TOKEN_INVALID:
+        fatalf("Invalid token");
+    case TOKEN_EOF:
+        fatalf("Unexpected EOF");
+    case TOKEN_POPEN: {
+        // start list
+        Thing *head = parser->ctx->nil;
+        Thing *current = parser->ctx->nil;
+        parser_next_token(parser);
+        while (parser->current_token->type != TOKEN_PCLOSE) {
+            Thing *t = parser_read(parser);
+            if (head == parser->ctx->nil) {
+                head = current = thing_cons(parser->ctx, t, parser->ctx->nil);
+            } else {
+                current = current->cons.cdr = thing_cons(parser->ctx, t, parser->ctx->nil);
+            }
+            parser_next_token(parser);
+        }
+        parser_next_token(parser);
+        return head;
+    }
+    case TOKEN_PCLOSE:
+        fatalf("Unexpected ')'");
+    case TOKEN_IDENTIFIER:
+        return thing_symbol_intern(parser->ctx,
+                (String){ .data = parser->input.data + parser->current_token->pos,
+                .len = parser->current_token->len });
+    case TOKEN_SYMBOL:
+        return thing_symbol_intern(parser->ctx,
+                (String){ .data = parser->input.data + parser->current_token->pos + 1,
+                .len = parser->current_token->len - 2 });
+    case TOKEN_NUM: {
+        i32 value = 0;
+        for (isize i = 0; i < parser->current_token->len; i++) {
+            u8 digit = parser->input.data[parser->current_token->pos+i];
+            value += cast(i32)(digit - '0');
+        }
+
+        return thing_num(parser->ctx, value);
+    }
+    }
+
+    fatalf("BUG: Unhandled token %d", parser->current_token->type);
+}
 
 // FILE *input;
 //
@@ -326,12 +554,17 @@ void print(Thing *t) {
 // }
 
 void ctx_init(Context *ctx) {
-    ctx->nil = thing_new(ctx, THING_NIL);
+    ctx->nil     = thing_new(ctx, THING_NIL);
+    ctx->symbols = ctx->nil;
 }
 
 int main(void) {
     Context ctx = { 0 };
     ctx_init(&ctx);
 
-    print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, "test"), ctx.nil)));
+    Parser parser = { 0 };
+    parser_init(&parser, &ctx, STR("(+ 1 2)"));
+    print(parser_read(&parser));
+
+    print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
 }
