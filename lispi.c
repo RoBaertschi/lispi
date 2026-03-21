@@ -413,7 +413,7 @@ Token *parser_read_symbol(Parser *parser) {
         parser_read_ch(parser);
     }
 
-    t.len = parser->ch_pos - t.pos;
+    t.len = parser->ch_pos - 1 - t.pos;
 
     return parser_clone_token(parser, t);
 }
@@ -510,7 +510,7 @@ Thing *parser_read(Parser *parser) {
     case TOKEN_SYMBOL:
         return thing_symbol_intern(parser->ctx,
                 (String){ .data = parser->input.data + parser->current_token->pos + 1,
-                .len = parser->current_token->len - 2 });
+                .len = parser->current_token->len - 1 });
     case TOKEN_NUM: {
         i32 value = 0;
         for (isize i = 0; i < parser->current_token->len; i++) {
