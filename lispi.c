@@ -533,6 +533,8 @@ void parser_init(Parser *parser, Context *ctx, String input) {
 }
 
 Thing *parser_read(Parser *parser) {
+    Thing *simple = NULL;
+
     switch (parser->current_token->type) {
     case TOKEN_INVALID:
         fatalf("Invalid token");
@@ -550,7 +552,6 @@ Thing *parser_read(Parser *parser) {
             } else {
                 current = current->cons.cdr = thing_cons(parser->ctx, t, parser->ctx->nil);
             }
-            parser_next_token(parser);
         }
         parser_next_token(parser);
         return head;
@@ -558,13 +559,15 @@ Thing *parser_read(Parser *parser) {
     case TOKEN_PCLOSE:
         fatalf("Unexpected ')'");
     case TOKEN_IDENTIFIER:
-        return thing_symbol_intern(parser->ctx,
+        simple = thing_symbol_intern(parser->ctx,
                 (String){ .data = parser->input.data + parser->current_token->pos,
                 .len = parser->current_token->len });
+        break;
     case TOKEN_SYMBOL:
-        return thing_symbol_intern(parser->ctx,
+        simple = thing_symbol_intern(parser->ctx,
                 (String){ .data = parser->input.data + parser->current_token->pos + 1,
                 .len = parser->current_token->len - 1 });
+        break;
     case TOKEN_NUM: {
         i32 value = 0;
         for (isize i = 0; i < parser->current_token->len; i++) {
@@ -572,11 +575,16 @@ Thing *parser_read(Parser *parser) {
             value += cast(i32)(digit - '0');
         }
 
-        return thing_num(parser->ctx, value);
+        simple = thing_num(parser->ctx, value);
+        break;
+    default:
+        fatalf("BUG: Unhandled token %d", parser->current_token->type);
     }
     }
 
-    fatalf("BUG: Unhandled token %d", parser->current_token->type);
+    parser_next_token(parser);
+
+    return simple;
 }
 
 // Eval
@@ -683,21 +691,61 @@ Thing *eval(Context *ctx, Thing *env, Thing *code) {
 
 // Builtins
 
-Thing *builtin_plus(Context *ctx, Thing *env, Thing *args) {
+typedef enum Math_Operator {
+    MATH_OP_ADD,
+    MATH_OP_SUB,
+    MATH_OP_MUL,
+    MATH_OP_DIV,
+} Math_Operator;
+
+Thing *handle_math(Context *ctx, Thing *env, Thing *args, Math_Operator op) {
     cast(void)env;
     i32 result = 0;
 
     Thing *evaluated_args = eval_list(ctx, env, args);
 
-    for (Thing *num_cons = evaluated_args; num_cons != ctx->nil; num_cons = num_cons->cons.cdr) {
-        Thing *num = num_cons->cons.car;
-        if (num->type != THING_NUM) {
-            fatalf("Invalid argument to '+' of type %d", num->type);
-        }
-        result += num->num;
+#define HANDLE_MATH_FOR_EACH(op) \
+    for (Thing *num_cons = evaluated_args; num_cons != ctx->nil; num_cons = num_cons->cons.cdr) { \
+        Thing *num = num_cons->cons.car; \
+        if (num->type != THING_NUM) { \
+            fatalf("Invalid argument to '+' of type %d", num->type); \
+        } \
+        result op##= num->num;\
     }
 
+    switch (op) {
+    case MATH_OP_ADD:
+        HANDLE_MATH_FOR_EACH(+);
+        break;
+    case MATH_OP_SUB:
+        HANDLE_MATH_FOR_EACH(-);
+        break;
+    case MATH_OP_MUL:
+        HANDLE_MATH_FOR_EACH(*);
+        break;
+    case MATH_OP_DIV:
+        HANDLE_MATH_FOR_EACH(/);
+        break;
+    }
+#undef HANDLE_MATH_FOR_EACH
+
     return thing_num(ctx, result);
+}
+
+Thing *builtin_add(Context *ctx, Thing *env, Thing *args) {
+    return handle_math(ctx, env, args, MATH_OP_ADD);
+}
+
+Thing *builtin_sub(Context *ctx, Thing *env, Thing *args) {
+    return handle_math(ctx, env, args, MATH_OP_SUB);
+}
+
+Thing *builtin_mul(Context *ctx, Thing *env, Thing *args) {
+    return handle_math(ctx, env, args, MATH_OP_MUL);
+}
+
+Thing *builtin_div(Context *ctx, Thing *env, Thing *args) {
+    return handle_math(ctx, env, args, MATH_OP_DIV);
 }
 
 Thing *builtin_deffun(Context *ctx, Thing *env, Thing *args) {
@@ -736,7 +784,11 @@ void ctx_init(Context *ctx) {
     ctx->nil           = thing_new(ctx, THING_NIL);
     ctx->symbols       = ctx->nil;
     ctx->env           = thing_env(ctx, ctx->nil, ctx->nil);
-    env_add_builtin(ctx, ctx->env, STR("+"), builtin_plus);
+
+    env_add_builtin(ctx, ctx->env, STR("+"), builtin_add);
+    env_add_builtin(ctx, ctx->env, STR("-"), builtin_sub);
+    env_add_builtin(ctx, ctx->env, STR("*"), builtin_mul);
+    env_add_builtin(ctx, ctx->env, STR("/"), builtin_div);
     env_add_builtin(ctx, ctx->env, STR("deffun"), builtin_deffun);
 }
 
@@ -745,7 +797,7 @@ int main(void) {
     ctx_init(&ctx);
 
     Parser parser = { 0 };
-    parser_init(&parser, &ctx, STR("((deffun * (a b) (+ a b)) 3 3)"));
+    parser_init(&parser, &ctx, STR("(+ 3 (* 3 3 ) )"));
     print(eval(&ctx, ctx.env, parser_read(&parser)));
 
     // print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
