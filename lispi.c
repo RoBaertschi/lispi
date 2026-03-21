@@ -1,6 +1,7 @@
 // Small lisp implementation to learn lisp
 // Example (+ 1 2)
 
+#include <assert.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -236,6 +237,7 @@ typedef enum Thing_Type {
     THING_CONS,
     THING_SYMBOL,
     THING_FUNCTION,
+    THING_MACRO,
     THING_BUILTIN,
     THING_ENV,
 
@@ -316,8 +318,10 @@ Thing *thing_symbol_intern(Context *ctx, String name) {
     return sym;
 }
 
-Thing *thing_function(Context *ctx, Thing *params, Thing *code, Thing *env) {
-    Thing *thing           = thing_new(ctx, THING_FUNCTION);
+Thing *thing_function(Context *ctx, Thing *params, Thing *code, Thing *env, Thing_Type type) {
+    assert(type == THING_FUNCTION || type == THING_MACRO);
+
+    Thing *thing           = thing_new(ctx, type);
     thing->function.params = params;
     thing->function.code   = code;
     thing->function.env    = env;
@@ -343,16 +347,26 @@ void thing_kill(Context *ctx, Thing *thing) {
     ctx->dead_things = thing;
 }
 
-void print(Thing *t) {
+void print(Context *ctx, Thing *t) {
     switch (t->type) {
     case THING_NUM:
         printf("%d", t->num);
         break;
     case THING_CONS:
         printf("(");
-        print(t->cons.car);
-        printf(" . ");
-        print(t->cons.cdr);
+        Thing *current = t;
+        for (; current->type == THING_CONS; current = current->cons.cdr) {
+            if (current != t) {
+                printf(" ");
+            }
+            print(ctx, current->cons.car);
+        }
+
+        if (current != ctx->nil) {
+            printf(" . ");
+            print(ctx, t->cons.cdr);
+        }
+
         printf(")");
         break;
     case THING_SYMBOL:
@@ -365,21 +379,16 @@ void print(Thing *t) {
         printf("<dead>");
         break;
     case THING_FUNCTION:
-        printf("fn <");
-        print(t->function.env);
-        printf("> (");
-        print(t->function.params);
-        printf(")");
-        print(t->function.code);
+        printf("<function>");
+        break;
+    case THING_MACRO:
+        printf("<macro>");
         break;
     case THING_BUILTIN:
         printf("<builtin>");
         break;
     case THING_ENV:
-        printf("env ^ ");
-        print(t->env.parent);
-        printf(" -> ");
-        print(t->env.vars);
+        printf("<env>");
         break;
     }
 }
@@ -391,7 +400,9 @@ typedef enum Token_Type {
     TOKEN_EOF,
     TOKEN_POPEN,
     TOKEN_PCLOSE,
-    TOKEN_IDENTIFIER,
+    TOKEN_DOT,
+    TOKEN_QUOTE,
+
     TOKEN_SYMBOL,
     TOKEN_NUM,
 } Token_Type;
@@ -454,26 +465,8 @@ void parser_skip_whitespace(Parser *parser) {
     }
 }
 
-Token *parser_read_symbol(Parser *parser) {
-    Token t = { .type = TOKEN_SYMBOL, .pos = parser->ch_pos - 1 };
-
-    parser_read_ch(parser); // skip ':'
-
-    if(is_digit(parser->ch)) {
-        fatalf("Symbols starting with digits are invalid.");
-    }
-
-    while (!is_reserved_ch(parser->ch) && !is_whitespace_ch(parser->ch)) {
-        parser_read_ch(parser);
-    }
-
-    t.len = parser->ch_pos - 1 - t.pos;
-
-    return parser_clone_token(parser, t);
-}
-
 Token *parser_read_identifier(Parser *parser) {
-    Token t = { .type = TOKEN_IDENTIFIER, .pos = parser->ch_pos - 1 };
+    Token t = { .type = TOKEN_SYMBOL, .pos = parser->ch_pos - 1 };
 
     while (!is_reserved_ch(parser->ch) && !is_whitespace_ch(parser->ch)) {
         parser_read_ch(parser);
@@ -486,6 +479,10 @@ Token *parser_read_identifier(Parser *parser) {
 
 Token *parser_read_num(Parser *parser) {
     Token t = { .type = TOKEN_NUM, .pos = parser->ch_pos - 1 };
+
+    if (parser->ch == '-') {
+        parser_read_ch(parser);
+    }
 
     while (is_digit(parser->ch)) {
         parser_read_ch(parser);
@@ -501,16 +498,22 @@ Token *parser_read_token(Parser *parser) {
     Token t = { .pos = parser->ch_pos - 1, .len = 1 };
 
     switch (parser->ch) {
-    case 0:   t.type = TOKEN_EOF; break;
-    case '(': t.type = TOKEN_POPEN; break;
-    case ')': t.type = TOKEN_PCLOSE; break;
-    case ':': {
-        return parser_read_symbol(parser);
-    }
+    case 0:    t.type = TOKEN_EOF;    break;
+    case '(':  t.type = TOKEN_POPEN;  break;
+    case ')':  t.type = TOKEN_PCLOSE; break;
+    case '.':  t.type = TOKEN_DOT;    break;
+    case '\'': t.type = TOKEN_QUOTE;  break;
+    case '-':
+        if (is_digit(parser_peek_ch(parser))) {
+            return parser_read_num(parser);
+        }
+        goto skip_num;
     default: {
         if (is_digit(parser->ch)) {
             return parser_read_num(parser);
         }
+
+skip_num:
         return parser_read_identifier(parser);
     }
     }
@@ -532,6 +535,7 @@ void parser_init(Parser *parser, Context *ctx, String input) {
     parser_next_token(parser);
 }
 
+// Current token is new, ends on next new token
 Thing *parser_read(Parser *parser) {
     Thing *simple = NULL;
 
@@ -540,39 +544,66 @@ Thing *parser_read(Parser *parser) {
         fatalf("Invalid token");
     case TOKEN_EOF:
         fatalf("Unexpected EOF");
+    case TOKEN_QUOTE:
+        parser_next_token(parser);
+        Thing *list = parser_read(parser);
+        list = thing_cons(parser->ctx, thing_symbol_intern(parser->ctx, STR("quote")), thing_cons(parser->ctx, list, parser->ctx->nil));
+        return list;
     case TOKEN_POPEN: {
         // start list
-        Thing *head = NULL;
-        Thing *current = NULL;
         parser_next_token(parser);
+
+        if (parser->current_token->type == TOKEN_PCLOSE) {
+            parser_next_token(parser);
+            return parser->ctx->nil;
+        }
+
+        Thing *start = parser_read(parser);
+
+        if (parser->current_token->type == TOKEN_DOT) {
+            parser_next_token(parser);
+            Thing *cdr = parser_read(parser);
+            if (parser->current_token->type != TOKEN_PCLOSE) {
+                fatalf("Expected a ')' after a cons");
+            }
+            parser_next_token(parser);
+            return thing_cons(parser->ctx, start, cdr);
+        }
+
+        Thing *head = thing_cons(parser->ctx, start, parser->ctx->nil);
+        Thing *current = head;
+
         while (parser->current_token->type != TOKEN_PCLOSE) {
             Thing *t = parser_read(parser);
-            if (!head) {
-                head = current = thing_cons(parser->ctx, t, parser->ctx->nil);
-            } else {
-                current = current->cons.cdr = thing_cons(parser->ctx, t, parser->ctx->nil);
-            }
+            current = current->cons.cdr = thing_cons(parser->ctx, t, parser->ctx->nil);
         }
         parser_next_token(parser);
         return head;
     }
     case TOKEN_PCLOSE:
         fatalf("Unexpected ')'");
-    case TOKEN_IDENTIFIER:
+    case TOKEN_DOT:
+        fatalf("Unexpected '.'");
+    case TOKEN_SYMBOL:
         simple = thing_symbol_intern(parser->ctx,
                 (String){ .data = parser->input.data + parser->current_token->pos,
                 .len = parser->current_token->len });
         break;
-    case TOKEN_SYMBOL:
-        simple = thing_symbol_intern(parser->ctx,
-                (String){ .data = parser->input.data + parser->current_token->pos + 1,
-                .len = parser->current_token->len - 1 });
-        break;
     case TOKEN_NUM: {
         i32 value = 0;
-        for (isize i = 0; i < parser->current_token->len; i++) {
+        b32 neg   = false;
+
+        if (parser->current_token->len > 0 && parser->input.data[parser->current_token->pos] == '-') {
+            neg = true;
+        }
+
+        for (isize i = neg ? 1 : 0; i < parser->current_token->len; i++) {
             u8 digit = parser->input.data[parser->current_token->pos+i];
             value += cast(i32)(digit - '0');
+        }
+
+        if (neg) {
+            value = -value;
         }
 
         simple = thing_num(parser->ctx, value);
@@ -593,6 +624,23 @@ b32 is_list(Context *ctx, Thing *t) {
     return t == ctx->nil || t->type == THING_CONS;
 }
 
+isize list_length(Context *ctx, Thing *t) {
+    isize len = 0;
+
+    for (;;) {
+        if (t == ctx->nil) {
+            return len;
+        }
+
+        if (t->type != THING_CONS) {
+            fatalf("length: Invalid, non-cons, list item");
+        }
+
+        t    = t->cons.cdr;
+        len += 1;
+    }
+}
+
 Thing *eval(Context *ctx, Thing *env, Thing *code);
 
 Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
@@ -607,7 +655,7 @@ Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
     }
 
     if (env->env.parent == ctx->nil) {
-        fatalf("Could not find sym %.*s in environment", sym->symbol.len, sym->symbol.data);
+        return NULL;
     } else {
         return env_find(ctx, env->env.parent, sym);
     }
@@ -665,6 +713,31 @@ Thing *apply(Context *ctx, Thing *env, Thing *fn, Thing *args) {
     return eval(ctx, new_env, fn->function.code);
 }
 
+Thing *progn(Context *ctx, Thing *env, Thing *list) {
+    Thing *result = NULL;
+    for (Thing *element = list; element != ctx->nil; element = element->cons.cdr) {
+        result = eval(ctx, env, element->cons.car);
+    }
+    return result;
+}
+
+// Tries to apply a macro application
+Thing *macro_expand(Context *ctx, Thing *env, Thing *t) {
+    if (t->type != THING_CONS || t->cons.car->type != THING_SYMBOL) {
+        return t;
+    }
+
+    Thing *macro = env_find(ctx, env, t->cons.car);
+    if (!macro || macro->type != THING_MACRO) {
+        return t;
+    }
+
+    Thing *args = t->cons.cdr;
+    Thing *params = macro->function.params;
+    Thing *new_env = env_from_lists(ctx, env, params, args);
+    return progn(ctx, new_env, macro->function.code);
+}
+
 Thing *eval(Context *ctx, Thing *env, Thing *code) {
     switch (code->type) {
     case THING_NUM:
@@ -674,15 +747,25 @@ Thing *eval(Context *ctx, Thing *env, Thing *code) {
         return code;
 
     case THING_CONS: {
-        Thing *fn = eval(ctx, env, code->cons.car);
-        Thing *args = code->cons.cdr;
+        Thing *expaneded = macro_expand(ctx, env, code);
+        if (expaneded != code) {
+            return eval(ctx, env, expaneded);
+        }
+
+        Thing *fn = eval(ctx, env, expaneded->cons.car);
+        Thing *args = expaneded->cons.cdr;
         if (fn->type != THING_BUILTIN && fn->type != THING_FUNCTION) {
             fatalf("Expected function to call, got %d", fn->type);
         }
         return apply(ctx, env, fn, args);
     }
-    case THING_SYMBOL:
-        return env_find(ctx, env, code);
+    case THING_SYMBOL: {
+        Thing *t = env_find(ctx, env, code);
+        if (!t) {
+            fatalf("Could not find symbol");
+        }
+        return t;
+    }
     default:
         fatalf("Invalid thing type in eval: %d", code->type);
         break;
@@ -700,17 +783,26 @@ typedef enum Math_Operator {
 
 Thing *handle_math(Context *ctx, Thing *env, Thing *args, Math_Operator op) {
     cast(void)env;
-    i32 result = 0;
 
     Thing *evaluated_args = eval_list(ctx, env, args);
+    if (evaluated_args->type != THING_CONS) {
+        fatalf("op: one argument is required at least");
+    }
 
-#define HANDLE_MATH_FOR_EACH(op) \
+    Thing *num = evaluated_args->cons.car;
+    if (num->type != THING_NUM) {
+        fatalf("Invalid argument type to '+' of type %d", num->type);
+    }
+    i32 result = num->num;
+    evaluated_args = evaluated_args->cons.cdr;
+
+#define HANDLE_MATH_FOR_EACH(op)                                                                  \
     for (Thing *num_cons = evaluated_args; num_cons != ctx->nil; num_cons = num_cons->cons.cdr) { \
-        Thing *num = num_cons->cons.car; \
-        if (num->type != THING_NUM) { \
-            fatalf("Invalid argument to '+' of type %d", num->type); \
-        } \
-        result op##= num->num;\
+        Thing *num = num_cons->cons.car;                                                          \
+        if (num->type != THING_NUM) {                                                             \
+            fatalf("Invalid argument to '+' of type %d", num->type);                              \
+        }                                                                                         \
+        result op##= num->num;                                                                    \
     }
 
     switch (op) {
@@ -748,7 +840,7 @@ Thing *builtin_div(Context *ctx, Thing *env, Thing *args) {
     return handle_math(ctx, env, args, MATH_OP_DIV);
 }
 
-Thing *builtin_deffun(Context *ctx, Thing *env, Thing *args) {
+Thing *handle_deffun(Context *ctx, Thing *env, Thing *args, Thing_Type type) {
     Thing *fn_sym  = args->cons.car;
     Thing *fn_args = args->cons.cdr;
 
@@ -775,9 +867,36 @@ Thing *builtin_deffun(Context *ctx, Thing *env, Thing *args) {
         }
     }
 
-    Thing *fn = thing_function(ctx, fn_args->cons.car, fn_args->cons.cdr, env);
+    Thing *fn = thing_function(ctx, fn_args->cons.car, fn_args->cons.cdr, env, type);
     env_add_variable(ctx, env, fn_sym, fn);
     return fn;
+}
+
+Thing *builtin_deffun(Context *ctx, Thing *env, Thing *args) {
+    return handle_deffun(ctx, env, args, THING_FUNCTION);
+}
+
+Thing *builtin_defmacro(Context *ctx, Thing *env, Thing *args) {
+    return handle_deffun(ctx, env, args, THING_MACRO);
+}
+
+Thing *builtin_macroexpand(Context *ctx, Thing *env, Thing *args) {
+    Thing *evaluated_args = eval_list(ctx, env, args);
+    if (list_length(ctx, evaluated_args) != 1) {
+        fatalf("Malformed macroexpand");
+    }
+
+    Thing *code = evaluated_args->cons.car;
+    return macro_expand(ctx, env, code);
+}
+
+Thing *builtin_quote(Context *ctx, Thing *env, Thing *args) {
+    cast(void)env;
+    if (list_length(ctx, args) != 1) {
+        fatalf("quote: Only accept one argument");
+    }
+
+    return args->cons.car;
 }
 
 void ctx_init(Context *ctx) {
@@ -790,6 +909,9 @@ void ctx_init(Context *ctx) {
     env_add_builtin(ctx, ctx->env, STR("*"), builtin_mul);
     env_add_builtin(ctx, ctx->env, STR("/"), builtin_div);
     env_add_builtin(ctx, ctx->env, STR("deffun"), builtin_deffun);
+    env_add_builtin(ctx, ctx->env, STR("defmacro"), builtin_defmacro);
+    env_add_builtin(ctx, ctx->env, STR("macroexpand"), builtin_macroexpand);
+    env_add_builtin(ctx, ctx->env, STR("quote"), builtin_quote);
 }
 
 int main(void) {
@@ -797,8 +919,13 @@ int main(void) {
     ctx_init(&ctx);
 
     Parser parser = { 0 };
-    parser_init(&parser, &ctx, STR("(+ 3 (* 3 3 ) )"));
-    print(eval(&ctx, ctx.env, parser_read(&parser)));
+    parser_init(&parser, &ctx, STR("(defmacro identity-macro (x) x) (macroexpand '(identity-macro (this-function-does-not-exist 1 2 3)))"));
+
+    while (parser.current_token->type != TOKEN_EOF) {
+        print(&ctx, eval(&ctx, ctx.env, parser_read(&parser)));
+        printf("\n");
+    }
+
 
     // print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
     //
