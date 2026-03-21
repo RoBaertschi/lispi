@@ -27,7 +27,7 @@ typedef struct String {
     isize     len;
 } String;
 
-#define STR(...) (String){ .data = cast(u8 const*)(__VA_ARGS__), .len = sizeof(__VA_ARGS__) }
+#define STR(...) (String){ .data = cast(u8 const*)(__VA_ARGS__), .len = sizeof(__VA_ARGS__)-1 }
 
 b32 string_eq(String a, String b) {
     if (a.len != b.len) {
@@ -223,15 +223,21 @@ typedef struct Context {
     Arena        symbol_strings;
     Arena        things;
     struct Thing *symbols; // list of symbols, should probably be turned into a hash map at some point
+    struct Thing *env;
     struct Thing *dead_things;
 
     struct Thing *nil;
 } Context;
 
+typedef struct Thing *(*Builtin)(Context *ctx, struct Thing *env, struct Thing *args);
+
 typedef enum Thing_Type {
     THING_NUM,
     THING_CONS,
     THING_SYMBOL,
+    THING_FUNCTION,
+    THING_BUILTIN,
+    THING_ENV,
 
     THING_NIL,
 
@@ -248,6 +254,16 @@ typedef struct Thing {
             struct Thing *cdr;
         } cons;
         String symbol;
+        struct {
+            struct Thing *params;
+            struct Thing *code;
+            struct Thing *env;
+        } function;
+        Builtin builtin;
+        struct {
+            struct Thing *parent;
+            struct Thing *vars;
+        } env;
         struct Thing *next_dead;
     };
 } Thing;
@@ -300,6 +316,27 @@ Thing *thing_symbol_intern(Context *ctx, String name) {
     return sym;
 }
 
+Thing *thing_function(Context *ctx, Thing *params, Thing *code, Thing *env) {
+    Thing *thing           = thing_new(ctx, THING_FUNCTION);
+    thing->function.params = params;
+    thing->function.code   = code;
+    thing->function.env    = env;
+    return thing;
+}
+
+Thing *thing_builtin(Context *ctx, Builtin builtin) {
+    Thing *thing   = thing_new(ctx, THING_BUILTIN);
+    thing->builtin = builtin;
+    return thing;
+}
+
+Thing *thing_env(Context *ctx, Thing *parent, Thing *vars) {
+    Thing *thing      = thing_new(ctx, THING_ENV);
+    thing->env.parent = parent;
+    thing->env.vars   = vars;
+    return thing;
+}
+
 void thing_kill(Context *ctx, Thing *thing) {
     thing->type      = THING_DEAD;
     thing->next_dead = ctx->dead_things;
@@ -326,6 +363,23 @@ void print(Thing *t) {
         break;
     case THING_DEAD:
         printf("<dead>");
+        break;
+    case THING_FUNCTION:
+        printf("fn <");
+        print(t->function.env);
+        printf("> (");
+        print(t->function.params);
+        printf(")");
+        print(t->function.code);
+        break;
+    case THING_BUILTIN:
+        printf("<builtin>");
+        break;
+    case THING_ENV:
+        printf("env ^ ");
+        print(t->env.parent);
+        printf(" -> ");
+        print(t->env.vars);
         break;
     }
 }
@@ -486,12 +540,12 @@ Thing *parser_read(Parser *parser) {
         fatalf("Unexpected EOF");
     case TOKEN_POPEN: {
         // start list
-        Thing *head = parser->ctx->nil;
-        Thing *current = parser->ctx->nil;
+        Thing *head = NULL;
+        Thing *current = NULL;
         parser_next_token(parser);
         while (parser->current_token->type != TOKEN_PCLOSE) {
             Thing *t = parser_read(parser);
-            if (head == parser->ctx->nil) {
+            if (!head) {
                 head = current = thing_cons(parser->ctx, t, parser->ctx->nil);
             } else {
                 current = current->cons.cdr = thing_cons(parser->ctx, t, parser->ctx->nil);
@@ -525,37 +579,165 @@ Thing *parser_read(Parser *parser) {
     fatalf("BUG: Unhandled token %d", parser->current_token->type);
 }
 
-// FILE *input;
-//
-// Thing *read(void) {
-//     u8 c = getc(input);
-//     switch (c) {
-//         case '(': { // start list
-//             Thing *head = nil;
-//             Thing *current = nil;
-//             while (1) {
-//                 Thing *next = read();
-//                 if (next == nil) {
-//                     break;
-//                 }
-//
-//                 if (head == nil) {
-//                     head = thing_cons(next, nil);
-//                     current = head;
-//                 } else {
-//                     current = (current->cons.cdr = thing_cons(next, nil));
-//                 }
-//             }
-//             return head;
-//         }
-//     default:
-//         fatalf("Unexpected %c", c);
-//     }
-// }
+// Eval
+
+b32 is_list(Context *ctx, Thing *t) {
+    return t == ctx->nil || t->type == THING_CONS;
+}
+
+Thing *eval(Context *ctx, Thing *env, Thing *code);
+
+Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
+    for (Thing *key_value = env->env.vars; key_value != ctx->nil; key_value = key_value->cons.cdr) {
+        Thing *key_value_cons = key_value->cons.car;
+        Thing *key            = key_value_cons->cons.car;
+        Thing *value          = key_value_cons->cons.cdr;
+
+        if (key == sym) {
+            return value;
+        }
+    }
+
+    if (env->env.parent == ctx->nil) {
+        fatalf("Could not find sym %.*s in environment", sym->symbol.len, sym->symbol.data);
+    } else {
+        return env_find(ctx, env->env.parent, sym);
+    }
+}
+
+Thing *env_from_lists(Context *ctx, Thing *env, Thing *keys, Thing *values) {
+    Thing *vars = ctx->nil;
+
+    Thing *k = keys, *v = values;
+    for (; k != ctx->nil && v != ctx->nil; k = k->cons.cdr, v = v->cons.cdr) {
+        vars = thing_cons(ctx, thing_cons(ctx, k->cons.car, v->cons.car), vars);
+    }
+
+    if (k != ctx->nil || v != ctx->nil) {
+        fatalf("apply: Mismatch in length for keys and values");
+    }
+
+    return thing_env(ctx, env, vars);
+}
+
+void env_add_builtin(Context *ctx, Thing *env, String name, Builtin builtin) {
+    env->env.vars = thing_cons(ctx, thing_cons(ctx, thing_symbol_intern(ctx, name), thing_builtin(ctx, builtin)), env->env.vars);
+}
+
+void env_add_variable(Context *ctx, Thing *env, Thing *key, Thing *value) {
+    env->env.vars = thing_cons(ctx, thing_cons(ctx, key, value), env->env.vars);
+}
+
+Thing *eval_list(Context *ctx, Thing *env, Thing *list) {
+    Thing *head    = NULL;
+    Thing *current = NULL;
+
+    for (Thing *element = list; element != ctx->nil; element = element->cons.cdr) {
+        Thing *t = eval(ctx, env, element->cons.car);
+        if (head == NULL) {
+            current = head = thing_cons(ctx, t, ctx->nil);
+        } else {
+            current = current->cons.cdr = thing_cons(ctx, t, ctx->nil);
+        }
+    }
+
+    return head;
+}
+
+Thing *apply(Context *ctx, Thing *env, Thing *fn, Thing *args) {
+    if (!is_list(ctx, args)) {
+        fatalf("apply: args must be a list");
+    }
+    if (fn->type == THING_BUILTIN) {
+        return fn->builtin(ctx, env, args);
+    }
+
+    Thing *evaluated_args = eval_list(ctx, env, args);
+    Thing *new_env = env_from_lists(ctx, fn->function.env, fn->function.params, evaluated_args);
+    return eval(ctx, new_env, fn->function.code);
+}
+
+Thing *eval(Context *ctx, Thing *env, Thing *code) {
+    switch (code->type) {
+    case THING_NUM:
+    case THING_NIL:
+    case THING_FUNCTION:
+    case THING_BUILTIN:
+        return code;
+
+    case THING_CONS: {
+        Thing *fn = eval(ctx, env, code->cons.car);
+        Thing *args = code->cons.cdr;
+        if (fn->type != THING_BUILTIN && fn->type != THING_FUNCTION) {
+            fatalf("Expected function to call, got %d", fn->type);
+        }
+        return apply(ctx, env, fn, args);
+    }
+    case THING_SYMBOL:
+        return env_find(ctx, env, code);
+    default:
+        fatalf("Invalid thing type in eval: %d", code->type);
+        break;
+    }
+}
+
+// Builtins
+
+Thing *builtin_plus(Context *ctx, Thing *env, Thing *args) {
+    cast(void)env;
+    i32 result = 0;
+
+    Thing *evaluated_args = eval_list(ctx, env, args);
+
+    for (Thing *num_cons = evaluated_args; num_cons != ctx->nil; num_cons = num_cons->cons.cdr) {
+        Thing *num = num_cons->cons.car;
+        if (num->type != THING_NUM) {
+            fatalf("Invalid argument to '+' of type %d", num->type);
+        }
+        result += num->num;
+    }
+
+    return thing_num(ctx, result);
+}
+
+Thing *builtin_deffun(Context *ctx, Thing *env, Thing *args) {
+    Thing *fn_sym  = args->cons.car;
+    Thing *fn_args = args->cons.cdr;
+
+    if (fn_sym->type != THING_SYMBOL) {
+        fatalf("deffun: Required symbol as first argument");
+    }
+
+    if (fn_args->type != THING_CONS || !is_list(ctx, fn_args->cons.car)) {
+        fatalf("deffun: Parameter list must be a list");
+    }
+
+    if (fn_args->cons.cdr->type != THING_CONS) {
+        fatalf("deffun: Body must be a list");
+    }
+
+    // Validate params
+    for (Thing *param = fn_args->cons.car; param != ctx->nil; param = param->cons.cdr) {
+        if (param->cons.car->type != THING_SYMBOL) {
+            fatalf("deffun: Parameter must be a symbol");
+        }
+
+        if (!is_list(ctx, param->cons.cdr)) {
+            fatalf("deffun: Parameter must be a flat list");
+        }
+    }
+
+    Thing *fn = thing_function(ctx, fn_args->cons.car, fn_args->cons.cdr, env);
+    env_add_variable(ctx, env, fn_sym, fn);
+    return fn;
+}
 
 void ctx_init(Context *ctx) {
-    ctx->nil     = thing_new(ctx, THING_NIL);
-    ctx->symbols = ctx->nil;
+    ctx->nil           = thing_new(ctx, THING_NIL);
+    ctx->symbols       = ctx->nil;
+    ctx->env           = thing_env(ctx, ctx->nil, ctx->nil);
+    env_add_builtin(ctx, ctx->env, STR("+"), builtin_plus);
+    env_add_builtin(ctx, ctx->env, STR("deffun"), builtin_deffun);
 }
 
 int main(void) {
@@ -563,8 +745,10 @@ int main(void) {
     ctx_init(&ctx);
 
     Parser parser = { 0 };
-    parser_init(&parser, &ctx, STR("(+ 1 2)"));
-    print(parser_read(&parser));
+    parser_init(&parser, &ctx, STR("((deffun * (a b) (+ a b)) 3 3)"));
+    print(eval(&ctx, ctx.env, parser_read(&parser)));
 
-    print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
+    // print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
+    //
+    // print(thing_function(&ctx, thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil), ctx.nil));
 }
