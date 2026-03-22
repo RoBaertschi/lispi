@@ -599,6 +599,7 @@ Thing *parser_read(Parser *parser) {
 
         for (isize i = neg ? 1 : 0; i < parser->current_token->len; i++) {
             u8 digit = parser->input.data[parser->current_token->pos+i];
+            value *= 10;
             value += cast(i32)(digit - '0');
         }
 
@@ -644,21 +645,19 @@ isize list_length(Context *ctx, Thing *t) {
 Thing *eval(Context *ctx, Thing *env, Thing *code);
 
 Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
-    for (Thing *key_value = env->env.vars; key_value != ctx->nil; key_value = key_value->cons.cdr) {
-        Thing *key_value_cons = key_value->cons.car;
-        Thing *key            = key_value_cons->cons.car;
-        Thing *value          = key_value_cons->cons.cdr;
+    for (; env != ctx->nil; env = env->env.parent) {
+        for (Thing *key_value = env->env.vars; key_value != ctx->nil; key_value = key_value->cons.cdr) {
+            Thing *key_value_cons = key_value->cons.car;
+            Thing *key            = key_value_cons->cons.car;
+            Thing *value          = key_value_cons->cons.cdr;
 
-        if (key == sym) {
-            return value;
+            if (key == sym) {
+                return value;
+            }
         }
     }
 
-    if (env->env.parent == ctx->nil) {
-        return NULL;
-    } else {
-        return env_find(ctx, env->env.parent, sym);
-    }
+    return NULL;
 }
 
 Thing *env_from_lists(Context *ctx, Thing *env, Thing *keys, Thing *values) {
