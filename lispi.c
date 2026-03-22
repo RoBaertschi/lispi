@@ -385,6 +385,7 @@ typedef struct Context {
     Arena        symbol_strings;
     Arena        things;
     isize        alive_things;
+    isize        total_things;
     struct Thing *symbols; // list of symbols, should probably be turned into a hash map at some point
     struct Thing *env;
     struct Thing *dead_things;
@@ -574,6 +575,7 @@ Thing *thing_new(Context *ctx, Root *root, Thing_Type type) {
     thing->type = type;
 
     ctx->alive_things += 1;
+    ctx->total_things += 1;
     return thing;
 }
 
@@ -1285,13 +1287,15 @@ int main(void) {
         ctx_init(&ctx, root);
 
         Parser parser = { 0 };
-        parser_init(&parser, &ctx, STR("(define x 3) (gc) x"));
+        parser_init(&parser, &ctx, STR("(define x 3) (gc) x (deffun test () 3) (gc) ()"));
 
         while (parser.current_token->type != TOKEN_EOF) {
             result = parser_read(&parser, root);
             print(&ctx, eval(&ctx, root, ctx.env, result));
             printf("\n");
         }
+
+        printf("Alive/Total things: %zd/%zd\n", ctx.alive_things, ctx.total_things);
 
         parser_destroy(&parser);
         ctx_destroy(&ctx);
