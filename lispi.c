@@ -379,16 +379,77 @@ void bit_array_clear_all(Bit_Array *head) {
     }
 }
 
+// Symbol Map
+
+u32 hash(String s) {
+    u32 hash = 2166136261u;
+    for (isize i = 0; i < s.len; i++) {
+        hash ^= s.data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+typedef struct Symbol {
+    struct Thing *thing;
+} Symbol;
+
+typedef struct Symbol_Map {
+    struct Symbol_Map *child[4];
+    String            key;
+    Symbol            value;
+} Symbol_Map;
+
+Symbol *symbol_map_upsert(Symbol_Map **m, String key, Arena *arena) {
+    for (u32 h = hash(key); *m; h <<= 2) {
+        if (string_eq(key, (*m)->key)) {
+            return &(*m)->value;
+        }
+        m = &(*m)->child[h>>30];
+    }
+    if (!arena) {
+        return NULL;
+    }
+
+    *m          = arena_alloc_align(arena, sizeof(Symbol_Map), sizeof(void *));
+    (*m)->key   = key;
+    return &(*m)->value;
+}
+
+Symbol *symbol_map_upsert_free_list(Symbol_Map **m, String key, Symbol_Map **free_list, Arena *arena) {
+    for (u32 h = hash(key); *m; h <<= 2) {
+        if (string_eq(key, (*m)->key)) {
+            return &(*m)->value;
+        }
+        m = &(*m)->child[h>>30];
+    }
+    if (!arena) {
+        return NULL;
+    }
+
+    if (*free_list) {
+        *m         = *free_list;
+        *free_list = (*free_list)->child[0];
+    } else {
+        *m = arena_alloc_align(arena, sizeof(Symbol_Map), sizeof(void *));
+    }
+
+    (*m)->key = key;
+    return &(*m)->value;
+}
+
 // Basics
 
 typedef struct Context {
-    Arena        symbol_strings;
-    Arena        things;
+    Arena        things; // NOTE: It is assumed that this arena only contains Thing's and nothing else, do not use it for anything else
     isize        alive_things;
     isize        total_things;
-    struct Thing *symbols; // list of symbols, should probably be turned into a hash map at some point
-    struct Thing *env;
     struct Thing *dead_things;
+
+    Arena        symbols; // NOTE: Contains both the symbol interning table and the environment table
+    Symbol_Map   *symbol_map;
+    Symbol_Map   *dead_envs;
+    struct Thing *env;
 
     isize gc_things_threshold; // when reached, the gc will be run on the next thing_new
 
@@ -432,7 +493,7 @@ typedef struct Thing {
         Builtin builtin;
         struct {
             struct Thing *parent;
-            struct Thing *vars;
+            Symbol_Map   *vars;
         } env;
         struct Thing *next_dead;
     };
@@ -482,6 +543,9 @@ typedef struct Root {
     Thing *(var4) = NULL;                              \
     root->things[3] = &(var4)
 
+
+void gc_mark_symbol_map(Context *ctx, Symbol_Map *map);
+
 void gc_mark(Context *ctx, Thing *thing) {
     if (!thing || thing->marked /* avoid marking things more than once (avoids circular dependencies to) */) {
         return;
@@ -508,18 +572,45 @@ void gc_mark(Context *ctx, Thing *thing) {
         break;
     case THING_ENV:
         gc_mark(ctx, thing->env.parent);
-        gc_mark(ctx, thing->env.vars);
+        gc_mark_symbol_map(ctx, thing->env.vars);
         break;
     }
 }
 
 void thing_kill(Context *ctx, Thing *thing);
 
-void gc(struct Context *ctx, Root *root) {
+void gc_mark_symbol_map(Context *ctx, Symbol_Map *map) {
+    if (map->value.thing) {
+        gc_mark(ctx, map->value.thing);
+    }
+
+    for (isize i = 0; i < 4; i++) {
+        if (map->child[i]) {
+            gc_mark_symbol_map(ctx, map->child[i]);
+        }
+    }
+}
+
+isize gc_sweep_symbol_map(Context *ctx, Symbol_Map *map) {
+    isize count = 0;
+
+    for (isize i = 0; i < 4; i++) {
+        if (map->child[i]) {
+            count += gc_sweep_symbol_map(ctx, map->child[i]);
+        }
+    }
+
+    zero(map);
+    map->child[0]  = ctx->dead_envs;
+    ctx->dead_envs = map;
+    return count + 1;
+}
+
+void gc(Context *ctx, Root *root) {
     printf("Running gc %zd\n", ctx->gc_things_threshold);
     gc_mark(ctx, ctx->env);
     gc_mark(ctx, ctx->nil);
-    gc_mark(ctx, ctx->symbols);
+    gc_mark_symbol_map(ctx, ctx->symbol_map);
 
     for(Root *current_root = root; current_root; current_root = current_root->parent) {
         for (isize i = 0; i < current_root->thing_count; i++) {
@@ -533,6 +624,7 @@ void gc(struct Context *ctx, Root *root) {
     }
 
     isize killed = 0;
+    isize symbols_maps_killed = 0;
 
     // sweep
     for (Arena_Block *block = ctx->things.first; block; block = block->next) {
@@ -541,15 +633,30 @@ void gc(struct Context *ctx, Root *root) {
 
         for (isize i = 0; i < thing_count; i++) {
             Thing *thing = &things[i];
-            if (!thing->marked && thing->type != THING_DEAD) {
-                killed += 1;
-                thing_kill(ctx, &things[i]);
+            if (thing->marked) {
+                goto done;
             }
+
+            switch (thing->type) {
+            case THING_DEAD:
+                break;
+            case THING_ENV:
+                // free all symbols
+                symbols_maps_killed += gc_sweep_symbol_map(ctx, thing->env.vars);
+
+                goto kill;
+            default:
+kill:
+                killed += 1;
+                thing_kill(ctx, thing);
+            }
+
+done:
             thing->marked = false;
         }
     }
 
-    printf("GC done, killed %zd\n", killed);
+    printf("GC done, killed %zd things and %zd symbol maps\n", killed, symbols_maps_killed);
 }
 
 // Alloc functions
@@ -594,7 +701,7 @@ Thing *thing_cons(Context *ctx, Root *root, Thing *car, Thing *cdr) {
 
 Thing *thing_symbol(Context *ctx, Root *root, String name) {
     Thing *thing       = thing_new(ctx, root, THING_SYMBOL);
-    thing->symbol.data = arena_alloc_align(&ctx->symbol_strings, name.len, 1);
+    thing->symbol.data = arena_alloc_align(&ctx->symbols, name.len, 1);
     thing->symbol.len  = name.len;
     memcpy((u8*)thing->symbol.data, name.data, name.len);
     return thing;
@@ -602,16 +709,14 @@ Thing *thing_symbol(Context *ctx, Root *root, String name) {
 
 Thing *thing_symbol_intern(Context *ctx, Root *root, String name) {
     ROOT_VARS1(sym);
-    for (Thing *sym_cons = ctx->symbols; sym_cons != ctx->nil; sym_cons = sym_cons->cons.cdr) {
-        Thing *sym = sym_cons->cons.car;
-        if (string_eq(name, sym->symbol)) {
-            return sym;
-        }
+
+    Symbol *symbol = symbol_map_upsert(&ctx->symbol_map, name, &ctx->symbols);
+    if (symbol->thing) {
+        return symbol->thing;
     }
 
-    sym = thing_symbol(ctx, root, name);
-    ctx->symbols = thing_cons(ctx, root, sym, ctx->symbols);
-    return sym;
+    symbol->thing = thing_symbol(ctx, root, name);
+    return symbol->thing;
 }
 
 Thing *thing_function(Context *ctx, Root *root, Thing *params, Thing *code, Thing *env, Thing_Type type) {
@@ -630,7 +735,7 @@ Thing *thing_builtin(Context *ctx, Root *root, Builtin builtin) {
     return thing;
 }
 
-Thing *thing_env(Context *ctx, Root *root, Thing *parent, Thing *vars) {
+Thing *thing_env(Context *ctx, Root *root, Thing *parent, Symbol_Map *vars) {
     Thing *thing      = thing_new(ctx, root, THING_ENV);
     thing->env.parent = parent;
     thing->env.vars   = vars;
@@ -963,14 +1068,9 @@ Thing *eval(Context *ctx, Root *root, Thing *env, Thing *code);
 
 Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
     for (; env != ctx->nil; env = env->env.parent) {
-        for (Thing *key_value = env->env.vars; key_value != ctx->nil; key_value = key_value->cons.cdr) {
-            Thing *key_value_cons = key_value->cons.car;
-            Thing *key            = key_value_cons->cons.car;
-            Thing *value          = key_value_cons->cons.cdr;
-
-            if (key == sym) {
-                return value;
-            }
+        Symbol *symbol = symbol_map_upsert(&env->env.vars, sym->symbol, NULL);
+        if (symbol) {
+            return symbol->thing;
         }
     }
 
@@ -978,13 +1078,14 @@ Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
 }
 
 Thing *env_from_lists(Context *ctx, Root *root, Thing *env, Thing *keys, Thing *values) {
-    ROOT_VARS3(vars, k, v);
+    ROOT_VARS2(k, v);
 
-    vars = ctx->nil;
+    Symbol_Map *vars = NULL;
     k = keys, v = values;
 
     for (; k != ctx->nil && v != ctx->nil; k = k->cons.cdr, v = v->cons.cdr) {
-        vars = thing_acons(ctx, root, k->cons.car, v->cons.car, vars);
+        Symbol *symbol = symbol_map_upsert_free_list(&vars, k->cons.car->symbol, &ctx->dead_envs, &ctx->symbols);
+        symbol->thing = v->cons.car;
     }
 
     if (k != ctx->nil || v != ctx->nil) {
@@ -996,14 +1097,15 @@ Thing *env_from_lists(Context *ctx, Root *root, Thing *env, Thing *keys, Thing *
 
 void env_add_builtin(Context *ctx, Root *root, Thing *env, String name, Builtin builtin) {
     ROOT_VARS2(sym, builtin_thing);
-    sym           = thing_symbol_intern(ctx, root, name);
-    builtin_thing = thing_builtin(ctx, root, builtin);
-
-    env->env.vars = thing_acons(ctx, root, sym, builtin_thing, env->env.vars);
+    sym            = thing_symbol_intern(ctx, root, name);
+    builtin_thing  = thing_builtin(ctx, root, builtin);
+    Symbol *symbol = symbol_map_upsert_free_list(&env->env.vars, sym->symbol, &ctx->dead_envs, &ctx->symbols);
+    symbol->thing  = builtin_thing;
 }
 
-void env_add_variable(Context *ctx, Root *root, Thing *env, Thing *key, Thing *value) {
-    env->env.vars = thing_acons(ctx, root, key, value, env->env.vars);
+void env_add_variable(Context *ctx, Thing *env, Thing *key, Thing *value) {
+    Symbol *symbol = symbol_map_upsert_free_list(&env->env.vars, key->symbol, &ctx->dead_envs, &ctx->symbols);
+    symbol->thing  = value;
 }
 
 Thing *eval_list(Context *ctx, Root *root, Thing *env, Thing *list) {
@@ -1089,7 +1191,7 @@ Thing *eval(Context *ctx, Root *root, Thing *env, Thing *code) {
     case THING_SYMBOL: {
         Thing *t = env_find(ctx, env, code);
         if (!t) {
-            fatalf("Could not find symbol");
+            fatalf("Could not find symbol: %.*s", cast(int)code->symbol.len, code->symbol.data);
         }
         return t;
     }
@@ -1169,37 +1271,47 @@ Thing *builtin_div(Context *ctx, Root *root, Thing *env, Thing *args) {
     return handle_math(ctx, root, env, args, MATH_OP_DIV);
 }
 
-Thing *handle_deffun(Context *ctx, Root *root, Thing *env, Thing *args, Thing_Type type) {
-    ROOT_VARS3(fn_sym, fn_args, fn);
-
-    fn_sym  = args->cons.car;
-    fn_args = args->cons.cdr;
-
-    if (fn_sym->type != THING_SYMBOL) {
-        fatalf("deffun: Required symbol as first argument");
-    }
-
-    if (fn_args->type != THING_CONS || !is_list(ctx, fn_args->cons.car)) {
+Thing *handle_function(Context *ctx, Root *root, Thing *env, Thing *args, Thing_Type type) {
+    if (args->type != THING_CONS || !is_list(ctx, args->cons.car)) {
         fatalf("deffun: Parameter list must be a list");
     }
 
-    if (fn_args->cons.cdr->type != THING_CONS) {
+    if (args->cons.cdr->type != THING_CONS) {
         fatalf("deffun: Body must be a list");
     }
 
     // Validate params
-    for (Thing *param = fn_args->cons.car; param != ctx->nil; param = param->cons.cdr) {
+    Thing *param = args->cons.car;
+    for (; param->type == THING_CONS; param = param->cons.cdr) {
         if (param->cons.car->type != THING_SYMBOL) {
-            fatalf("deffun: Parameter must be a symbol");
+            fatalf("lambda: Parameter must be a symbol");
         }
 
         if (!is_list(ctx, param->cons.cdr)) {
-            fatalf("deffun: Parameter must be a flat list");
+            fatalf("lambda: Parameter must be a flat list");
         }
     }
 
-    fn = thing_function(ctx, root, fn_args->cons.car, fn_args->cons.cdr, env, type);
-    env_add_variable(ctx, root, env, fn_sym, fn);
+    if (param != ctx->nil && param->type != THING_SYMBOL) {
+        fatalf("lambda: Parameter must be a symbol");
+    }
+
+    ROOT_VARS2(params, code);
+    params = args->cons.car;
+    code = args->cons.cdr;
+    return thing_function(ctx, root, params, code, env, type);
+}
+
+Thing *builtin_lambda(Context *ctx, Root *root, Thing *env, Thing *args) {
+    return handle_function(ctx, root, env, args, THING_FUNCTION);
+}
+
+Thing *handle_deffun(Context *ctx, Root *root, Thing *env, Thing *args, Thing_Type type) {
+    ROOT_VARS3(fn_sym, fn_args, fn);
+    fn_sym  = args->cons.car;
+    fn_args = args->cons.cdr;
+    fn      = handle_function(ctx, root, env, fn_args, type);
+    env_add_variable(ctx, env, fn_sym, fn);
     return fn;
 }
 
@@ -1220,7 +1332,7 @@ Thing *builtin_define(Context *ctx, Root *root, Thing *env, Thing *args) {
     sym = args->cons.car;
     value = args->cons.cdr->cons.car;
     value = eval(ctx, root, env, value);
-    env_add_variable(ctx, root, env, sym, value);
+    env_add_variable(ctx, env, sym, value);
     return value;
 }
 
@@ -1256,13 +1368,13 @@ Thing *builtin_gc(Context *ctx, Root *root, Thing *env, Thing *args) {
 void ctx_init(Context *ctx, Root *root) {
     ctx->gc_things_threshold = 32;
     ctx->nil                 = thing_new(ctx, root, THING_NIL);
-    ctx->symbols             = ctx->nil;
-    ctx->env                 = thing_env(ctx, root, ctx->nil, ctx->nil);
+    ctx->env                 = thing_env(ctx, root, ctx->nil, NULL);
 
     env_add_builtin(ctx, root, ctx->env, STR("+"), builtin_add);
     env_add_builtin(ctx, root, ctx->env, STR("-"), builtin_sub);
     env_add_builtin(ctx, root, ctx->env, STR("*"), builtin_mul);
     env_add_builtin(ctx, root, ctx->env, STR("/"), builtin_div);
+    env_add_builtin(ctx, root, ctx->env, STR("lambda"), builtin_lambda);
     env_add_builtin(ctx, root, ctx->env, STR("deffun"), builtin_deffun);
     env_add_builtin(ctx, root, ctx->env, STR("defmacro"), builtin_defmacro);
     env_add_builtin(ctx, root, ctx->env, STR("define"), builtin_define);
@@ -1273,7 +1385,7 @@ void ctx_init(Context *ctx, Root *root) {
 
 void ctx_destroy(Context *ctx) {
     arena_destroy(&ctx->things);
-    arena_destroy(&ctx->symbol_strings);
+    arena_destroy(&ctx->symbols);
     zero(ctx);
 }
 
@@ -1287,7 +1399,7 @@ int main(void) {
         ctx_init(&ctx, root);
 
         Parser parser = { 0 };
-        parser_init(&parser, &ctx, STR("(define x 3) (gc) x (deffun test () 3) (gc) ()"));
+        parser_init(&parser, &ctx, STR("(define x 3) (gc) x ((lambda (deez) deez) 3) () (gc) ()"));
 
         while (parser.current_token->type != TOKEN_EOF) {
             result = parser_read(&parser, root);
