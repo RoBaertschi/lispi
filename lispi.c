@@ -592,6 +592,9 @@ void gc_mark_symbol_map(Context *ctx, Symbol_Map *map) {
 }
 
 isize gc_sweep_symbol_map(Context *ctx, Symbol_Map *map) {
+    if (!map) {
+        return 0;
+    }
     isize count = 0;
 
     for (isize i = 0; i < 4; i++) {
@@ -1065,6 +1068,7 @@ isize list_length(Context *ctx, Thing *t) {
 }
 
 Thing *eval(Context *ctx, Root *root, Thing *env, Thing *code);
+Thing *progn(Context *ctx, Root *root, Thing *env, Thing *list);
 
 Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
     for (; env != ctx->nil; env = env->env.parent) {
@@ -1135,7 +1139,7 @@ Thing *apply(Context *ctx, Root *root, Thing *env, Thing *fn, Thing *args) {
 
     evaluated_args = eval_list(ctx, root, env, args);
     new_env        = env_from_lists(ctx, root, fn->function.env, fn->function.params, evaluated_args);
-    return eval(ctx, root, new_env, fn->function.code);
+    return progn(ctx, root, new_env, fn->function.code);
 }
 
 Thing *progn(Context *ctx, Root *root, Thing *env, Thing *list) {
@@ -1399,7 +1403,7 @@ int main(void) {
         ctx_init(&ctx, root);
 
         Parser parser = { 0 };
-        parser_init(&parser, &ctx, STR("(define x 3) (gc) x ((lambda (deez) deez) 3) () (gc) ()"));
+        parser_init(&parser, &ctx, STR("(define x 3) x ((lambda (deez) deez) 3) (gc) (gc)"));
 
         while (parser.current_token->type != TOKEN_EOF) {
             result = parser_read(&parser, root);
