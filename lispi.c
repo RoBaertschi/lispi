@@ -170,7 +170,7 @@ void arena_reset_to(Arena *arena, usize pos) {
     block->next                = NULL;
     Arena_Block *next_block    = current_block ? current_block->next : NULL;
     while (current_block) {
-        free(current_block->memory);
+        free(current_block);
         if (!next_block) {
             break;
         }
@@ -178,6 +178,22 @@ void arena_reset_to(Arena *arena, usize pos) {
         current_block = next_block;
         next_block    = next_block->next;
     }
+}
+
+void arena_destroy(Arena *arena) {
+    Arena_Block *current_block = arena->first;
+    Arena_Block *next_block    = current_block ? current_block->next : NULL;
+    while (current_block) {
+        free(current_block);
+        if (!next_block) {
+            break;
+        }
+
+        current_block = next_block;
+        next_block    = next_block->next;
+    }
+
+    zero(arena);
 }
 
 typedef struct Arena_Temp {
@@ -200,10 +216,6 @@ void arena_temp_cleanup(Arena_Temp *temp) {
     arena_reset_temp(*temp);
 }
 
-void free_wrapper(void *data) {
-    free(*(cast(void**)data));
-}
-
 #define ARENA_TEMP_GUARD(temp, arena) __attribute__((cleanup(arena_temp_cleanup))) Arena_Temp temp = arena_get_temp(arena);
 #define TEMP_ARENA_COUNT 2
 __thread Arena temp_arenas[TEMP_ARENA_COUNT];
@@ -224,6 +236,13 @@ skip:
     fatalf("Could not find temp arena.\n");
     return NULL;
 }
+
+void temp_arenas_destroy(void) {
+    for (isize i = 0; i < TEMP_ARENA_COUNT; i++) {
+        arena_destroy(&temp_arenas[i]);
+    }
+}
+
 #define TEMP_ARENA_VAR(temp, ...) ARENA_TEMP_GUARD(temp, temp_arena_get((Arena*[]){ __VA_ARGS__ }, sizeof(((Arena*[]){ __VA_ARGS__ })) / sizeof(((Arena*[]){ __VA_ARGS__ })[0])))
 #define TEMP_ARENA(...) TEMP_ARENA_VAR(temp, __VA_ARGS__)
 #define TEMP_ARENA_EMPTY ARENA_TEMP_GUARD(temp, temp_arena_get(NULL, 0))
@@ -819,6 +838,11 @@ void parser_init(Parser *parser, Context *ctx, String input) {
     parser_next_token(parser);
 }
 
+void parser_destroy(Parser *parser) {
+    arena_destroy(&parser->tokens);
+    zero(parser);
+}
+
 // Current token is new, ends on next new token
 Thing *parser_read(Parser *parser, Root *root) {
     Thing *simple = NULL;
@@ -1221,6 +1245,8 @@ Thing *builtin_quote(Context *ctx, Root *root, Thing *env, Thing *args) {
 }
 
 Thing *builtin_gc(Context *ctx, Root *root, Thing *env, Thing *args) {
+    cast(void)env;
+    cast(void)args;
     gc(ctx, root);
     return ctx->nil;
 }
@@ -1243,22 +1269,35 @@ void ctx_init(Context *ctx, Root *root) {
     env_add_builtin(ctx, root, ctx->env, STR("gc"), builtin_gc);
 }
 
+void ctx_destroy(Context *ctx) {
+    arena_destroy(&ctx->things);
+    arena_destroy(&ctx->symbol_strings);
+    zero(ctx);
+}
+
 int main(void) {
-    Context ctx = { 0 };
+    {
+        Context ctx = { 0 };
 
-    Root *root = NULL;
-    ROOT_VARS1(result);
+        Root *root = NULL;
+        ROOT_VARS1(result);
 
-    ctx_init(&ctx, root);
+        ctx_init(&ctx, root);
 
-    Parser parser = { 0 };
-    parser_init(&parser, &ctx, STR("(define x 3) (gc) x"));
+        Parser parser = { 0 };
+        parser_init(&parser, &ctx, STR("(define x 3) (gc) x"));
 
-    while (parser.current_token->type != TOKEN_EOF) {
-        result = parser_read(&parser, root);
-        print(&ctx, eval(&ctx, root, ctx.env, result));
-        printf("\n");
+        while (parser.current_token->type != TOKEN_EOF) {
+            result = parser_read(&parser, root);
+            print(&ctx, eval(&ctx, root, ctx.env, result));
+            printf("\n");
+        }
+
+        parser_destroy(&parser);
+        ctx_destroy(&ctx);
     }
+
+    temp_arenas_destroy();
 
     // print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
     //
