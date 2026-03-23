@@ -1,383 +1,7 @@
 // Small lisp implementation to learn lisp
 // Example (+ 1 2)
 
-#include <assert.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdarg.h>
-#include <stdnoreturn.h>
-#include <string.h>
-
-#define cast(T) (T)
-#define zero(v) memset((v), 0, sizeof(*(v)))
-
-typedef uint8_t   u8;
-typedef int32_t   i32;
-typedef uint32_t  u32;
-typedef i32       b32;
-typedef size_t    isize;
-typedef ptrdiff_t usize;
-typedef uintptr_t uintptr;
-
-#define false 0
-#define true 1
-
-#define global static
-
-typedef struct String {
-    u8 const *data;
-    isize     len;
-} String;
-
-#define STR(...) (String){ .data = cast(u8 const*)(__VA_ARGS__), .len = sizeof(__VA_ARGS__)-1 }
-
-b32 string_eq(String a, String b) {
-    if (a.len != b.len) {
-        return false;
-    }
-
-    for (isize i = 0; i < a.len; i++) {
-        if (a.data[i] != b.data[i]) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-typedef struct Arena_Block {
-    struct Arena_Block *next;
-    void               *memory;
-    usize              cap;
-    usize              len;
-} Arena_Block;
-
-noreturn void fatalf(char const *format, ...) {
-    va_list list;
-    va_start(list, format);
-
-    vfprintf(stderr, format, list);
-
-    va_end(list);
-    exit(1);
-}
-
-#define ALIGNMENT_PADDING(value, alignment) ((alignment) - ((value) & ((alignment) - 1))) & ((alignment) - 1)
-
-void *arena_block_alloc_align(Arena_Block *block, isize size, usize align) {
-    if (size <= 0) {
-        fatalf("Invalid negative or zero size supplied to arena_block_alloc_align\n");
-    }
-
-    usize unsigned_size     = cast(usize)size;
-    usize padding           = ALIGNMENT_PADDING(block->len, align);
-
-    if (block->len + padding + unsigned_size > block->cap) {
-        return NULL;
-    }
-
-    block->len += padding;
-    void *data  = cast(void*)((cast(uintptr)block->memory) + block->len);
-    block->len += size;
-    return data;
-}
-
-void *arena_block_alloc(Arena_Block *block, isize size) {
-    return arena_block_alloc_align(block, size, 16);
-}
-
-Arena_Block *arena_block_new(usize size) {
-    Arena_Block *block = calloc(1, sizeof(Arena_Block) + size);
-    if (!block) {
-        fatalf("OOM\n");
-    }
-    block->memory = cast(void*)((cast(uintptr)block) + sizeof(Arena_Block));
-    block->cap    = size;
-    return block;
-}
-
-Arena_Block *arena_block_new_min(usize default_size, usize size) {
-    usize block_size = default_size < size ? size : default_size;
-    return arena_block_new(block_size);
-}
-
-typedef struct Arena {
-    Arena_Block *first;
-    Arena_Block *current;
-    usize       default_mem_block_size;
-    usize       len;
-} Arena;
-
-void *arena_alloc_align(Arena *arena, isize size, usize align) {
-    if (size <= 0) {
-        fatalf("Invalid negative or zero size supplied to arena_block_alloc_align\n");
-    }
-
-    if (!arena->current) {
-        if (!arena->default_mem_block_size) {
-            arena->default_mem_block_size = 1024 * 1024 * 64; // NOTE: 64MB
-        }
-
-        Arena_Block *block = arena_block_new_min(arena->default_mem_block_size, size);
-        arena->current = block;
-        arena->first   = block;
-
-        void *data = arena_block_alloc_align(arena->current, size, align);
-        if (data) {
-            arena->len += size;
-        }
-        return data;
-    }
-
-    void *data = arena_block_alloc_align(arena->current, size, align);
-    if (!data) {
-        // Not enough space in block
-        arena->current->next = arena_block_new_min(arena->default_mem_block_size, size);
-        arena->current = arena->current->next;
-        data = arena_block_alloc_align(arena->current, size, align);
-    }
-
-    if (data) {
-        arena->len += size;
-    }
-    return data;
-}
-
-void *arena_alloc(Arena *arena, isize size) {
-    return arena_alloc_align(arena, size, 16);
-}
-
-void arena_reset_to(Arena *arena, usize pos) {
-    Arena_Block *block = arena->current;
-
-    for (; block && pos > block->len; block = block->next) {
-        pos -= block->len;
-    }
-
-    if (!block) {
-        // NOTE: pos outside of allocated blocks
-        return;
-    }
-
-    if (block->len > pos) {
-        memset(cast(void*)(cast(uintptr)block->memory + pos), 0, block->len - pos);
-        block->len = pos;
-    }
-
-    Arena_Block *current_block = block->next;
-    block->next                = NULL;
-    Arena_Block *next_block    = current_block ? current_block->next : NULL;
-    while (current_block) {
-        free(current_block);
-        if (!next_block) {
-            break;
-        }
-
-        current_block = next_block;
-        next_block    = next_block->next;
-    }
-}
-
-void arena_destroy(Arena *arena) {
-    Arena_Block *current_block = arena->first;
-    Arena_Block *next_block    = current_block ? current_block->next : NULL;
-    while (current_block) {
-        free(current_block);
-        if (!next_block) {
-            break;
-        }
-
-        current_block = next_block;
-        next_block    = next_block->next;
-    }
-
-    zero(arena);
-}
-
-typedef struct Arena_Temp {
-    Arena *arena;
-    usize pos;
-} Arena_Temp;
-
-Arena_Temp arena_get_temp(Arena *arena) {
-    return (Arena_Temp){
-        .arena = arena,
-        .pos   = arena->len,
-    };
-}
-
-void arena_reset_temp(Arena_Temp temp) {
-    arena_reset_to(temp.arena, temp.pos);
-}
-
-void arena_temp_cleanup(Arena_Temp *temp) {
-    arena_reset_temp(*temp);
-}
-
-#define ARENA_TEMP_GUARD(temp, arena) __attribute__((cleanup(arena_temp_cleanup))) Arena_Temp temp = arena_get_temp(arena);
-#define TEMP_ARENA_COUNT 2
-__thread Arena temp_arenas[TEMP_ARENA_COUNT];
-
-Arena *temp_arena_get(Arena **collisions, isize collision_count) {
-    for (isize i = 0; i < TEMP_ARENA_COUNT; i++) {
-        for (isize j = 0; j < collision_count; j++) {
-            if (collisions[j] == &temp_arenas[i]) {
-                goto skip;
-            }
-        }
-
-        return &temp_arenas[i];
-skip:
-        ;
-    }
-
-    fatalf("Could not find temp arena.\n");
-    return NULL;
-}
-
-void temp_arenas_destroy(void) {
-    for (isize i = 0; i < TEMP_ARENA_COUNT; i++) {
-        arena_destroy(&temp_arenas[i]);
-    }
-}
-
-#define TEMP_ARENA_VAR(temp, ...) ARENA_TEMP_GUARD(temp, temp_arena_get((Arena*[]){ __VA_ARGS__ }, sizeof(((Arena*[]){ __VA_ARGS__ })) / sizeof(((Arena*[]){ __VA_ARGS__ })[0])))
-#define TEMP_ARENA(...) TEMP_ARENA_VAR(temp, __VA_ARGS__)
-#define TEMP_ARENA_EMPTY ARENA_TEMP_GUARD(temp, temp_arena_get(NULL, 0))
-
-// Bit array
-
-void bits_clear(u32 *bits, isize from, isize to) {
-    isize from_index  = from / 32;
-    isize to_index    = to / 32;
-    isize from_offset = from % 32;
-    isize to_offset   = to % 32;
-
-    if (from_index == to_index) {
-        u32 *ptr = &bits[from_index];
-        u32 mask = ((cast(u32)1 << (to_offset - from_offset)) - cast(u32)1) << from_offset;
-        *ptr &= ~mask;
-        return;
-    }
-
-    u32 from_mask = ((cast(u32)1 << from_offset) - cast(u32)1);
-    bits[from_index] &= from_mask;
-
-    u32 to_mask = ~((cast(u32)1 << to_offset) - cast(u32)1);
-    bits[to_index] &= to_mask;
-
-    for (isize i = from_index + 1; i < to_index; i++) {
-        bits[i] = 0;
-    }
-}
-
-void bits_fill(u32 *bits, isize from, isize to) {
-    isize from_index  = from / 32;
-    isize to_index    = to / 32;
-    isize from_offset = from % 32;
-    isize to_offset   = to % 32;
-
-    if (from_index == to_index) {
-        u32 *ptr = &bits[from_index];
-        u32 mask = ((cast(u32)1 << (to_offset - from_offset)) - cast(u32)1) << from_offset;
-        *ptr |= mask;
-        return;
-    }
-
-    u32 from_mask = ((cast(u32)1 << from_offset) - cast(u32)1);
-    bits[from_index] |= ~from_mask;
-
-    u32 to_mask = ((cast(u32)1 << to_offset) - cast(u32)1);
-    bits[to_index] |= to_mask;
-
-    for (isize i = from_index + 1; i < to_index; i++) {
-        bits[i] = ~cast(u32)0;
-    }
-}
-
-void bits_set_bit(u32 *bits, isize i) {
-    isize index    = i / 32;
-    isize actual_i = i % 32;
-
-    bits[index] |= cast(u32)1 << actual_i;
-}
-
-void bits_clear_bit(u32 *bits, isize i) {
-    isize index    = i / 32;
-    isize actual_i = i % 32;
-
-    bits[index] &= ~(cast(u32)1 << actual_i);
-}
-
-#define PAGE_SIZE 1024 * 4
-
-typedef struct Bit_Array {
-    struct Bit_Array *next;
-    isize            len;
-    u32              bits[];
-} Bit_Array;
-
-global isize const bit_array_size = PAGE_SIZE;
-global isize const bit_array_bits_size = bit_array_size - offsetof(Bit_Array, bits);
-global isize const bit_array_bits_size_bits = bit_array_bits_size * 8;
-
-// NOTE: array_arena is used to extend the Bit_Array
-void bit_array_set(Arena *array_arena, Bit_Array *array, isize pos) {
-    isize arrays   = pos / bit_array_bits_size_bits;
-    isize actual_i = pos % bit_array_bits_size_bits;
-
-    Bit_Array *found_array = array;
-    for (isize i = 0; i < arrays; i++) {
-        if (found_array->len < bit_array_bits_size_bits) {
-            bits_clear(found_array->bits, found_array->len, bit_array_bits_size_bits);
-            found_array->len = bit_array_bits_size_bits;
-        }
-
-        if (!found_array->next) {
-            found_array->next = arena_alloc_align(array_arena, bit_array_size, 16);
-        }
-
-        found_array = found_array->next;
-    }
-
-    if (found_array->len < actual_i) {
-        found_array->len = actual_i + 1;
-    }
-
-    bits_set_bit(found_array->bits, actual_i);
-}
-
-b32 bit_array_get(Bit_Array *array, isize pos) {
-    isize arrays   = pos / bit_array_bits_size_bits;
-    isize actual_i = pos % bit_array_bits_size_bits;
-
-    Bit_Array *found_array = array;
-    for (isize i = 0; i < arrays; i++) {
-        if (found_array->len < bit_array_bits_size_bits) {
-            return false;
-        }
-
-        if (!found_array->next) {
-            return false;
-        }
-
-        found_array = found_array->next;
-    }
-
-    isize bits_index = actual_i / 32;
-    isize bits_i     = actual_i % 32;
-
-    return !!(found_array->bits[bits_index] & (cast(u32)1 << bits_i));
-}
-
-void bit_array_clear_all(Bit_Array *head) {
-    for (Bit_Array *array = head; array; array = array->next) {
-        memset(array->bits, 0, bit_array_bits_size);
-        array->len = 0;
-    }
-}
+#include "core.c"
 
 // Symbol Map
 
@@ -450,10 +74,12 @@ typedef struct Context {
     Symbol_Map   *symbol_map;
     Symbol_Map   *dead_envs;
     struct Thing *env;
+    i32          gen_symbol_counter;
 
     isize gc_things_threshold; // when reached, the gc will be run on the next thing_new
 
     struct Thing *nil;
+    struct Thing *t;
 } Context;
 
 struct Root;
@@ -470,6 +96,7 @@ typedef enum Thing_Type {
     THING_ENV,
 
     THING_NIL,
+    THING_T, // evaluates to itself
 
     // Unused and free to use
     THING_DEAD,
@@ -558,8 +185,8 @@ void gc_mark(Context *ctx, Thing *thing) {
     case THING_DEAD:
     case THING_SYMBOL:
     case THING_BUILTIN:
+    case THING_T:
         break;
-
     case THING_CONS:
         gc_mark(ctx, thing->cons.car);
         gc_mark(ctx, thing->cons.cdr);
@@ -610,7 +237,9 @@ isize gc_sweep_symbol_map(Context *ctx, Symbol_Map *map) {
 }
 
 void gc(Context *ctx, Root *root) {
+    #if GC_DEBUG
     printf("Running gc %zd\n", ctx->gc_things_threshold);
+    #endif
     gc_mark(ctx, ctx->env);
     gc_mark(ctx, ctx->nil);
     gc_mark_symbol_map(ctx, ctx->symbol_map);
@@ -659,7 +288,9 @@ done:
         }
     }
 
+    #if GC_DEBUG
     printf("GC done, killed %zd things and %zd symbol maps\n", killed, symbols_maps_killed);
+    #endif
 }
 
 // Alloc functions
@@ -706,7 +337,7 @@ Thing *thing_symbol(Context *ctx, Root *root, String name) {
     Thing *thing       = thing_new(ctx, root, THING_SYMBOL);
     thing->symbol.data = arena_alloc_align(&ctx->symbols, name.len, 1);
     thing->symbol.len  = name.len;
-    memcpy((u8*)thing->symbol.data, name.data, name.len);
+    memcpy(cast(u8*)thing->symbol.data, name.data, name.len);
     return thing;
 }
 
@@ -787,6 +418,9 @@ void print(Context *ctx, Thing *t) {
         break;
     case THING_NIL:
         printf("nil");
+        break;
+    case THING_T:
+        printf("t");
         break;
     case THING_DEAD:
         printf("<dead>");
@@ -1081,6 +715,17 @@ Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
     return NULL;
 }
 
+Symbol *env_find_symbol(Context *ctx, Thing *env, Thing *sym) {
+    for (; env != ctx->nil; env = env->env.parent) {
+        Symbol *symbol = symbol_map_upsert(&env->env.vars, sym->symbol, NULL);
+        if (symbol) {
+            return symbol;
+        }
+    }
+
+    return NULL;
+}
+
 Thing *env_from_lists(Context *ctx, Root *root, Thing *env, Thing *keys, Thing *values) {
     ROOT_VARS2(k, v);
 
@@ -1093,6 +738,7 @@ Thing *env_from_lists(Context *ctx, Root *root, Thing *env, Thing *keys, Thing *
     }
 
     if (k != ctx->nil || v != ctx->nil) {
+        printf("k: %d, v: %d", k->type, v->type);
         fatalf("apply: Mismatch in length for keys and values");
     }
 
@@ -1122,6 +768,10 @@ Thing *eval_list(Context *ctx, Root *root, Thing *env, Thing *list) {
         } else {
             current = current->cons.cdr = thing_cons(ctx, root, t, ctx->nil);
         }
+    }
+
+    if (!head) {
+        head = ctx->nil;
     }
 
     return head;
@@ -1275,6 +925,52 @@ Thing *builtin_div(Context *ctx, Root *root, Thing *env, Thing *args) {
     return handle_math(ctx, root, env, args, MATH_OP_DIV);
 }
 
+
+typedef enum Cmp_Operator {
+    CMP_OP_LT,
+    CMP_OP_GT,
+    CMP_OP_EQ,
+} Cmp_Operator;
+
+Thing *handle_cmp(Context *ctx, Root *root, Thing *env, Thing *args, Cmp_Operator op) {
+    cast(void)env;
+
+    ROOT_VARS2(evaluated_args, result);
+
+    evaluated_args = eval_list(ctx, root, env, args);
+    if (list_length(ctx, evaluated_args) != 2) {
+        fatalf("cmp-op: exactly 2 arguments are required");
+    }
+
+    if (evaluated_args->cons.car->type != THING_NUM || evaluated_args->cons.cdr->cons.car->type != THING_NUM) {
+        fatalf("cmp-op: arguments have to be nums");
+    }
+
+    i32 first  = evaluated_args->cons.car->num;
+    i32 second = evaluated_args->cons.cdr->cons.car->num;
+
+    switch (op) {
+    case CMP_OP_LT: result = first <  second ? ctx->t : ctx->nil; break;
+    case CMP_OP_GT: result = first >  second ? ctx->t : ctx->nil; break;
+    case CMP_OP_EQ: result = first == second ? ctx->t : ctx->nil; break;
+        break;
+    }
+
+    return result;
+}
+
+Thing *builtin_lt(Context *ctx, Root *root, Thing *env, Thing *args) {
+    return handle_cmp(ctx, root, env, args, CMP_OP_LT);
+}
+
+Thing *builtin_gt(Context *ctx, Root *root, Thing *env, Thing *args) {
+    return handle_cmp(ctx, root, env, args, CMP_OP_GT);
+}
+
+Thing *builtin_eq(Context *ctx, Root *root, Thing *env, Thing *args) {
+    return handle_cmp(ctx, root, env, args, CMP_OP_EQ);
+}
+
 Thing *handle_function(Context *ctx, Root *root, Thing *env, Thing *args, Thing_Type type) {
     if (args->type != THING_CONS || !is_list(ctx, args->cons.car)) {
         fatalf("deffun: Parameter list must be a list");
@@ -1362,6 +1058,102 @@ Thing *builtin_quote(Context *ctx, Root *root, Thing *env, Thing *args) {
     return args->cons.car;
 }
 
+Thing *builtin_cons(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (list_length(ctx, args) != 2) {
+        fatalf("Malformed cons");
+    }
+    Thing *cell = eval_list(ctx, root, env, args);
+    cell->cons.cdr = cell->cons.cdr->cons.car;
+    return cell;
+}
+
+Thing *builtin_car(Context *ctx, Root *root, Thing *env, Thing *args) {
+    Thing *evaluated_args = eval_list(ctx, root, env, args);
+    if (evaluated_args->cons.car->type != THING_CONS || evaluated_args->cons.cdr != ctx->nil) {
+        fatalf("Malformed car");
+    }
+    return args->cons.car->cons.car;
+}
+
+Thing *builtin_cdr(Context *ctx, Root *root, Thing *env, Thing *args) {
+    Thing *evaluated_args = eval_list(ctx, root, env, args);
+    if (evaluated_args->cons.car->type != THING_CONS || evaluated_args->cons.cdr != ctx->nil) {
+        fatalf("Malformed cdr");
+    }
+    return args->cons.car->cons.cdr;
+}
+
+Thing *builtin_setq(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (list_length(ctx, args) != 2 || args->cons.car->type != THING_SYMBOL) {
+        fatalf("Malformed setq");
+    }
+
+    ROOT_VARS2(bind, value);
+    // TODO(robin): add some way to add symbols directly to the root
+    Symbol *bind_symbol = env_find_symbol(ctx, env, args->cons.car);
+    if (!bind_symbol) {
+        fatalf("Could not find variable %.*s\n", cast(int)args->cons.car->symbol.len, args->cons.car->symbol.data);
+    }
+    bind = bind_symbol->thing;
+    value = args->cons.cdr->cons.car;
+    value = eval(ctx, root, env, value);
+    bind_symbol->thing = value;
+    return value;
+}
+
+Thing *builtin_setcar(Context *ctx, Root *root, Thing *env, Thing *args) {
+    ROOT_VARS1(evaluated_args);
+    evaluated_args = eval_list(ctx, root, env, args);
+    if (list_length(ctx, evaluated_args) != 2 || evaluated_args->cons.car->type != THING_CONS) {
+        fatalf("Malformed setcar");
+    }
+    evaluated_args->cons.car->cons.car = evaluated_args->cons.cdr;
+    return evaluated_args->cons.car;
+}
+
+Thing *builtin_while(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (list_length(ctx, args) < 2) {
+        fatalf("Malformed while");
+    }
+
+    ROOT_VARS2(cond, exprs);
+    cond = args->cons.car;
+    while (eval(ctx, root, env, cond) != ctx->nil) {
+        exprs = args->cons.cdr;
+        eval_list(ctx, root, env, exprs);
+    }
+
+    return ctx->nil;
+}
+
+Thing *builtin_gensym(Context *ctx, Root *root, Thing *env, Thing *args) {
+    cast(void)env;
+    cast(void)args;
+    char buf[10] = { 0 };
+    snprintf(buf, sizeof(buf), "G__%d", ctx->gen_symbol_counter++);
+    return thing_symbol(ctx, root, (String) { .data = cast(u8 const*)buf, .len = strlen(buf) });
+}
+
+Thing *builtin_print(Context *ctx, Root *root, Thing *env, Thing *args) {
+    ROOT_VARS1(evaluated_args);
+    evaluated_args = eval_list(ctx, root, env, args);
+
+    for (Thing *tmp = evaluated_args; tmp->type == THING_CONS; tmp = tmp->cons.cdr) {
+        print(ctx, tmp->cons.car);
+        printf("\n");
+    }
+
+    return ctx->nil;
+}
+
+Thing *builtin_thing_eq(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (list_length(ctx, args) != 2) {
+        fatalf("Malformed eq\n");
+    }
+    Thing *values = eval_list(ctx, root, env, args);
+    return values->cons.car == values->cons.cdr->cons.car ? ctx->t : ctx->nil;
+}
+
 Thing *builtin_gc(Context *ctx, Root *root, Thing *env, Thing *args) {
     cast(void)env;
     cast(void)args;
@@ -1372,18 +1164,36 @@ Thing *builtin_gc(Context *ctx, Root *root, Thing *env, Thing *args) {
 void ctx_init(Context *ctx, Root *root) {
     ctx->gc_things_threshold = 32;
     ctx->nil                 = thing_new(ctx, root, THING_NIL);
+    ctx->t                   = thing_new(ctx, root, THING_T);
     ctx->env                 = thing_env(ctx, root, ctx->nil, NULL);
+
+    ROOT_VARS1(tmp);
+    tmp = thing_symbol_intern(ctx, root, STR("t"));
+
+    env_add_variable(ctx, ctx->env, tmp, ctx->t);
 
     env_add_builtin(ctx, root, ctx->env, STR("+"), builtin_add);
     env_add_builtin(ctx, root, ctx->env, STR("-"), builtin_sub);
     env_add_builtin(ctx, root, ctx->env, STR("*"), builtin_mul);
     env_add_builtin(ctx, root, ctx->env, STR("/"), builtin_div);
+    env_add_builtin(ctx, root, ctx->env, STR("<"), builtin_lt);
+    env_add_builtin(ctx, root, ctx->env, STR(">"), builtin_gt);
+    env_add_builtin(ctx, root, ctx->env, STR("="), builtin_eq);
     env_add_builtin(ctx, root, ctx->env, STR("lambda"), builtin_lambda);
     env_add_builtin(ctx, root, ctx->env, STR("deffun"), builtin_deffun);
     env_add_builtin(ctx, root, ctx->env, STR("defmacro"), builtin_defmacro);
     env_add_builtin(ctx, root, ctx->env, STR("define"), builtin_define);
     env_add_builtin(ctx, root, ctx->env, STR("macroexpand"), builtin_macroexpand);
     env_add_builtin(ctx, root, ctx->env, STR("quote"), builtin_quote);
+    env_add_builtin(ctx, root, ctx->env, STR("cons"), builtin_cons);
+    env_add_builtin(ctx, root, ctx->env, STR("car"), builtin_car);
+    env_add_builtin(ctx, root, ctx->env, STR("cdr"), builtin_cdr);
+    env_add_builtin(ctx, root, ctx->env, STR("setq"), builtin_setq);
+    env_add_builtin(ctx, root, ctx->env, STR("setcar"), builtin_setcar);
+    env_add_builtin(ctx, root, ctx->env, STR("while"), builtin_while);
+    env_add_builtin(ctx, root, ctx->env, STR("gensym"), builtin_gensym);
+    env_add_builtin(ctx, root, ctx->env, STR("print"), builtin_print);
+    env_add_builtin(ctx, root, ctx->env, STR("eq"), builtin_thing_eq);
     env_add_builtin(ctx, root, ctx->env, STR("gc"), builtin_gc);
 }
 
@@ -1393,7 +1203,27 @@ void ctx_destroy(Context *ctx) {
     zero(ctx);
 }
 
-int main(void) {
+String read_entire_file(Arena *arena, char const *file_name) {
+    FILE *file = fopen(file_name, "rb");
+    if (!file) {
+        fatalf("Could not open file %s: %s\n", file_name, strerror(errno));
+    }
+    fseek(file, 0, SEEK_END);
+    isize size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    String data = { 0 };
+    data.data = arena_alloc_align(arena, size, sizeof(u8));
+    data.len  = cast(isize)fread(cast(void*)data.data, sizeof(u8), size, file);
+    return data;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fatalf("Missing arguments. Required at least one.\n");
+    }
+    Arena file_data = {0};
+    String data = read_entire_file(&file_data, argv[1]);
+
     {
         Context ctx = { 0 };
 
@@ -1403,23 +1233,26 @@ int main(void) {
         ctx_init(&ctx, root);
 
         Parser parser = { 0 };
-        parser_init(&parser, &ctx, STR("(define x 3) x ((lambda (deez) deez) 3) (gc) (gc)"));
+        parser_init(&parser, &ctx, data);
 
         while (parser.current_token->type != TOKEN_EOF) {
             result = parser_read(&parser, root);
-            print(&ctx, eval(&ctx, root, ctx.env, result));
+            // discard, not needed
+            result = eval(&ctx, root, ctx.env, result);
+            #if EVAL_DEBUG
+            print(&ctx, result);
             printf("\n");
+            #endif
         }
 
+        #if GC_DEBUG
         printf("Alive/Total things: %zd/%zd\n", ctx.alive_things, ctx.total_things);
+        #endif
 
         parser_destroy(&parser);
         ctx_destroy(&ctx);
     }
 
     temp_arenas_destroy();
-
-    // print(thing_cons(&ctx, thing_num(&ctx, 23), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil)));
-    //
-    // print(thing_function(&ctx, thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil), thing_cons(&ctx, thing_symbol(&ctx, STR("test")), ctx.nil), ctx.nil));
+    arena_destroy(&file_data);
 }

@@ -1,0 +1,14 @@
+(deffun xd () 'xd)
+
+(print (xd))
+(xd . ())
+(print (cons 1 ()))
+(print (cons 3 3) (xd . ()))
+
+(xd)
+(define x '(('id . 1)))
+(setq x 3)
+x
+
+(= 3 3)
+(eq 'a 'a)
