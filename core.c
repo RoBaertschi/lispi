@@ -107,6 +107,16 @@ char const *arena_clone_to_cstr(Arena *arena, String str) {
     return cstr;
 }
 
+String arena_clone_from_cstr(Arena *arena, char const *cstr) {
+    isize str_len = strlen(cstr);
+    u8 *str_data = arena_alloc_align(arena, str_len, sizeof(u8));
+    memcpy(str_data, cstr, str_len);
+    return (String){
+        .len  = str_len,
+        .data = str_data,
+    };
+}
+
 void arena_reset_to(Arena *arena, usize pos) {
     Arena_Block *block = arena->current;
 

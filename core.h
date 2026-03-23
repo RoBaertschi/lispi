@@ -24,6 +24,8 @@ typedef uintptr_t uintptr;
 #define false 0
 #define true 1
 
+#define BIT(x) (1 << (x))
+
 #define global static
 
 #ifdef DEBUG_ALL
@@ -74,6 +76,7 @@ typedef struct Arena {
 void       *arena_alloc_align(Arena *arena, isize size, usize align);
 void       *arena_alloc(Arena *arena, isize size);
 char const *arena_clone_to_cstr(Arena *arena, String str);
+String     arena_clone_from_cstr(Arena *arena, char const *cstr);
 void       arena_reset_to(Arena *arena, usize pos);
 void       arena_destroy(Arena *arena);
 

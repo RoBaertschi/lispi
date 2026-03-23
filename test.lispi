@@ -12,3 +12,40 @@ x
 
 (= 3 3)
 (eq 'a 'a)
+
+(print (list 1 2 3))
+
+(print `(xd ,xd))
+(defmacro set-to-five (var)
+ `(setq ,var 5))
+(set-to-five x)
+(print x)
+
+(defmacro wrap-call (fn-name args-list)
+  `(,fn-name ,@args-list))
+
+(setq my-args '(1 2 3))
+`(1 2 ,@my-args 6)
+
+(print 3)
+(macroexpand (wrap-call + my-args))
+(print 3)
+(wrap-call + (1 2 3))
+
+(defmacro augmented-list (middle-list)
+  `(1 2 ,@middle-list 6 7))
+
+(macroexpand (augmented-list '(3 4 5)))
+
+(setq x 500)
+`(the value is ,x)
+
+(defmacro debug-print (code)
+  `(progn
+     (print 69)
+     ,code))
+
+(debug-print (+ 1 2))
+
+
+(gc)

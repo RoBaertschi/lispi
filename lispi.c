@@ -2,6 +2,8 @@
 // Example (+ 1 2)
 
 #include "core.c"
+#include "core.h"
+#include "os_linux.c"
 
 // Symbol Map
 
@@ -389,6 +391,22 @@ Thing *thing_acons(Context *ctx, Root *root, Thing *x, Thing *y, Thing *a) {
     return thing_cons(ctx, root, cell, a);
 }
 
+Thing *thing_append(Context *ctx, Root *root, Thing *a, Thing *b) {
+    if (a == ctx->nil) {
+        return b;
+    }
+
+    if (a->type != THING_CONS) {
+        return thing_cons(ctx, root, a, b);
+    }
+
+    ROOT_VARS2(new_car, new_cdr);
+    new_car = a->cons.car;
+    new_cdr = thing_append(ctx, root, a->cons.cdr, b);
+
+    return thing_cons(ctx, root, new_car, new_cdr);
+}
+
 // Printer
 
 void print(Context *ctx, Thing *t) {
@@ -449,6 +467,9 @@ typedef enum Token_Type {
     TOKEN_PCLOSE,
     TOKEN_DOT,
     TOKEN_QUOTE,
+    TOKEN_BACKTICK,
+    TOKEN_COMMA,
+    TOKEN_COMMA_AT,
 
     TOKEN_SYMBOL,
     TOKEN_NUM,
@@ -499,7 +520,7 @@ b32 is_whitespace_ch(u8 ch) {
 }
 
 b32 is_reserved_ch(u8 ch) {
-    return ch == '(' || ch == ')' || ch == ':';
+    return ch == '(' || ch == ')' || ch == ':' || ch == '.' || ch == '\'' || ch == '`' || ch == ',' || ch == '@';
 }
 
 b32 is_digit(u8 ch) {
@@ -545,11 +566,22 @@ Token *parser_read_token(Parser *parser) {
     Token t = { .pos = parser->ch_pos - 1, .len = 1 };
 
     switch (parser->ch) {
-    case 0:    t.type = TOKEN_EOF;    break;
-    case '(':  t.type = TOKEN_POPEN;  break;
-    case ')':  t.type = TOKEN_PCLOSE; break;
-    case '.':  t.type = TOKEN_DOT;    break;
-    case '\'': t.type = TOKEN_QUOTE;  break;
+    case 0:    t.type = TOKEN_EOF;      break;
+    case '(':  t.type = TOKEN_POPEN;    break;
+    case ')':  t.type = TOKEN_PCLOSE;   break;
+    case '.':  t.type = TOKEN_DOT;      break;
+    case '\'': t.type = TOKEN_QUOTE;    break;
+    case '`':  t.type = TOKEN_BACKTICK; break;
+    case ',':
+        if (parser_peek_ch(parser) == '@') {
+            t.type = TOKEN_COMMA_AT;
+            t.len  = 2;
+            parser_read_ch(parser);
+            parser_read_ch(parser);
+            return parser_clone_token(parser, t);
+        }
+        t.type = TOKEN_COMMA;
+        break;
     case '-':
         if (is_digit(parser_peek_ch(parser))) {
             return parser_read_num(parser);
@@ -587,6 +619,18 @@ void parser_destroy(Parser *parser) {
     zero(parser);
 }
 
+Thing *parser_read(Parser *parser, Root *root);
+
+Thing *parser_produce_internal(Parser *parser, Root *root, String symbol) {
+    ROOT_VARS2(list, sym);
+    parser_next_token(parser);
+    sym  = thing_symbol_intern(parser->ctx, root, symbol);
+    list = parser_read(parser, root);
+    list = thing_cons(parser->ctx, root, list, parser->ctx->nil);
+    list = thing_cons(parser->ctx, root, sym, list);
+    return list;
+}
+
 // Current token is new, ends on next new token
 Thing *parser_read(Parser *parser, Root *root) {
     Thing *simple = NULL;
@@ -596,15 +640,10 @@ Thing *parser_read(Parser *parser, Root *root) {
         fatalf("Invalid token");
     case TOKEN_EOF:
         fatalf("Unexpected EOF");
-    case TOKEN_QUOTE: {
-        ROOT_VARS2(list, sym);
-        parser_next_token(parser);
-        sym = thing_symbol_intern(parser->ctx, root, STR("quote"));
-        list = parser_read(parser, root);
-        list = thing_cons(parser->ctx, root, list, parser->ctx->nil);
-        list = thing_cons(parser->ctx, root, sym, list);
-        return list;
-    }
+    case TOKEN_QUOTE:    return parser_produce_internal(parser, root, STR("quote"));
+    case TOKEN_BACKTICK: return parser_produce_internal(parser, root, STR("quasiquote"));
+    case TOKEN_COMMA:    return parser_produce_internal(parser, root, STR("unquote"));
+    case TOKEN_COMMA_AT: return parser_produce_internal(parser, root, STR("unquote-splicing"));
     case TOKEN_POPEN: {
         // start list
         parser_next_token(parser);
@@ -718,6 +757,17 @@ Thing *env_find(Context *ctx, Thing *env, Thing *sym) {
 Symbol *env_find_symbol(Context *ctx, Thing *env, Thing *sym) {
     for (; env != ctx->nil; env = env->env.parent) {
         Symbol *symbol = symbol_map_upsert(&env->env.vars, sym->symbol, NULL);
+        if (symbol) {
+            return symbol;
+        }
+    }
+
+    return NULL;
+}
+
+Symbol *env_find_or_create_symbol(Context *ctx, Thing *env, Thing *sym) {
+    for (; env != ctx->nil; env = env->env.parent) {
+        Symbol *symbol = symbol_map_upsert_free_list(&env->env.vars, sym->symbol, &ctx->dead_envs, &ctx->symbols);
         if (symbol) {
             return symbol;
         }
@@ -1036,16 +1086,16 @@ Thing *builtin_define(Context *ctx, Root *root, Thing *env, Thing *args) {
     return value;
 }
 
-Thing *builtin_macroexpand(Context *ctx, Root *root, Thing *env, Thing *args) {
-    ROOT_VARS2(evaluated_args, code);
+Thing *builtin_progn(Context *ctx, Root *root, Thing *env, Thing *args) {
+    return progn(ctx, root, env, args);
+}
 
-    evaluated_args = eval_list(ctx, root, env, args);
-    if (list_length(ctx, evaluated_args) != 1) {
+Thing *builtin_macroexpand(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (list_length(ctx, args) != 1) {
         fatalf("Malformed macroexpand");
     }
 
-    code = evaluated_args->cons.car;
-    return macro_expand(ctx, root, env, code);
+    return macro_expand(ctx, root, env, args->cons.car);
 }
 
 Thing *builtin_quote(Context *ctx, Root *root, Thing *env, Thing *args) {
@@ -1056,6 +1106,38 @@ Thing *builtin_quote(Context *ctx, Root *root, Thing *env, Thing *args) {
     }
 
     return args->cons.car;
+}
+
+Thing *quasiquote_expand(Context *ctx, Root *root, Thing *env, Thing *list) {
+    if (list->type != THING_CONS) {
+        return list;
+    }
+
+    ROOT_VARS4(sym, rest, element, result);
+    element = list;
+    sym = list->cons.car;
+    rest = list->cons.cdr;
+
+    if (sym->type == THING_SYMBOL && string_eq(sym->symbol, STR("unquote"))) {
+        return eval(ctx, root, env, rest->cons.car);
+    }
+    if (sym->type == THING_CONS && sym->cons.car->type == THING_SYMBOL && string_eq(sym->cons.car->symbol, STR("unquote-splicing"))) {
+        result = eval(ctx, root, env, sym->cons.cdr->cons.car);
+        rest = quasiquote_expand(ctx, root, env, rest);
+
+        return thing_append(ctx, root, result, rest);
+    }
+
+    sym = quasiquote_expand(ctx, root, env, sym);
+    rest = quasiquote_expand(ctx, root, env, rest);
+    return thing_cons(ctx, root, sym, rest);
+}
+
+Thing *builtin_quasiquote(Context *ctx, Root *root, Thing *env, Thing *args) {
+    if (args == ctx->nil) {
+        return ctx->nil;
+    }
+    return quasiquote_expand(ctx, root, env, args->cons.car);
 }
 
 Thing *builtin_cons(Context *ctx, Root *root, Thing *env, Thing *args) {
@@ -1090,15 +1172,18 @@ Thing *builtin_setq(Context *ctx, Root *root, Thing *env, Thing *args) {
 
     ROOT_VARS2(bind, value);
     // TODO(robin): add some way to add symbols directly to the root
-    Symbol *bind_symbol = env_find_symbol(ctx, env, args->cons.car);
-    if (!bind_symbol) {
-        fatalf("Could not find variable %.*s\n", cast(int)args->cons.car->symbol.len, args->cons.car->symbol.data);
-    }
+    Symbol *bind_symbol = env_find_or_create_symbol(ctx, env, args->cons.car);
     bind = bind_symbol->thing;
     value = args->cons.cdr->cons.car;
     value = eval(ctx, root, env, value);
     bind_symbol->thing = value;
     return value;
+}
+
+Thing *builtin_list(Context *ctx, Root *root, Thing *env, Thing *args) {
+    ROOT_VARS1(evaluated_args);
+    evaluated_args = eval_list(ctx, root, env, args);
+    return evaluated_args;
 }
 
 Thing *builtin_setcar(Context *ctx, Root *root, Thing *env, Thing *args) {
@@ -1183,11 +1268,14 @@ void ctx_init(Context *ctx, Root *root) {
     env_add_builtin(ctx, root, ctx->env, STR("deffun"), builtin_deffun);
     env_add_builtin(ctx, root, ctx->env, STR("defmacro"), builtin_defmacro);
     env_add_builtin(ctx, root, ctx->env, STR("define"), builtin_define);
+    env_add_builtin(ctx, root, ctx->env, STR("progn"), builtin_progn);
     env_add_builtin(ctx, root, ctx->env, STR("macroexpand"), builtin_macroexpand);
     env_add_builtin(ctx, root, ctx->env, STR("quote"), builtin_quote);
+    env_add_builtin(ctx, root, ctx->env, STR("quasiquote"), builtin_quasiquote);
     env_add_builtin(ctx, root, ctx->env, STR("cons"), builtin_cons);
     env_add_builtin(ctx, root, ctx->env, STR("car"), builtin_car);
     env_add_builtin(ctx, root, ctx->env, STR("cdr"), builtin_cdr);
+    env_add_builtin(ctx, root, ctx->env, STR("list"), builtin_list);
     env_add_builtin(ctx, root, ctx->env, STR("setq"), builtin_setq);
     env_add_builtin(ctx, root, ctx->env, STR("setcar"), builtin_setcar);
     env_add_builtin(ctx, root, ctx->env, STR("while"), builtin_while);
