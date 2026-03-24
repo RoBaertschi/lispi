@@ -1,0 +1,11 @@
+(defmacro package (name)
+    `(setq *package* ',name))
+
+(defmacro pdeffun (name params body)
+  `(deffun ,name ,params ,body))
+
+(package deez)
+(print *package*)
+
+(pdeffun hi () (print 'x))
+(print 'hi hi)

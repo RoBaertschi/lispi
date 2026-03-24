@@ -24,6 +24,8 @@ typedef uintptr_t uintptr;
 #define false 0
 #define true 1
 
+#define MIN(a, b) (b) < (a) ? (b) : (a)
+
 #define BIT(x) (1 << (x))
 
 #define global static

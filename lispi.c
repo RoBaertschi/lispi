@@ -4,6 +4,7 @@
 #include "core.c"
 #include "core.h"
 #include "os_linux.c"
+#include <stdio.h>
 
 // Symbol Map
 
@@ -64,6 +65,143 @@ Symbol *symbol_map_upsert_free_list(Symbol_Map **m, String key, Symbol_Map **fre
     return &(*m)->value;
 }
 
+// String Block
+
+typedef enum String_Block_Size {
+    STRING_BLOCK_SIZE_SMALL,
+    STRING_BLOCK_SIZE_MEDIUM,
+    STRING_BLOCK_SIZE_LARGE,
+    STRING_BLOCK_SIZE_HUGE,
+    STRING_BLOCK_SIZE__MAX,
+} String_Block_Size;
+
+// TODO(robin): find actual data for good block size
+global isize const string_block_sizes[STRING_BLOCK_SIZE__MAX] = {
+    64,
+    512,
+    1024 * 4,  // 4KB
+    1024 * 32, // 64 KB
+};
+
+global isize const string_block_sizes_thresholds[STRING_BLOCK_SIZE__MAX] = {
+    0,
+    384,
+    1024 * 3,  // 3KB
+    1024 * 24, // 24KB
+};
+
+typedef enum String_Block_Flags {
+    STRING_BLOCK_FLAG_SIZE1  = BIT(0),
+    STRING_BLOCK_FLAG_SIZE2  = BIT(1),
+    STRING_BLOCK_FLAG_MARKED = BIT(2), // has this been marked by the gc
+} String_Block_Flags;
+
+typedef struct String_Block {
+    struct String_Block *next;
+    isize               cap;
+    isize               len;
+    u8                  flags;
+    u8                  data[];
+} String_Block;
+
+typedef struct String_Set {
+    String_Block *head;
+    String_Block *tail;
+} String_Set;
+
+typedef String_Block *String_Block_Free_List[STRING_BLOCK_SIZE__MAX];
+
+String_Block *string_block_new(Arena *arena, String_Block_Size size, String_Block_Free_List free_list) {
+    String_Block *block = NULL;
+
+    if (free_list[size]) {
+        block           = free_list[size];
+        free_list[size] = block->next;
+    } else {
+        block = arena_alloc_align(arena, sizeof(String_Block) + string_block_sizes[size], sizeof(struct String_Block *));
+    }
+
+    block->len   = 0;
+    block->cap   = string_block_sizes[size];
+    block->flags = size;
+    return block;
+}
+
+String_Set string_block_build(Arena *arena, String s, String_Block_Free_List free_list) {
+    String_Block_Size largest = STRING_BLOCK_SIZE_SMALL;
+    for (; string_block_sizes_thresholds[largest] < s.len && largest <= STRING_BLOCK_SIZE_HUGE; largest += 1) {}
+
+    isize blocks          = s.len / string_block_sizes[largest];
+    String_Block *head    = NULL;
+    String_Block *current = NULL;
+    isize rest            = s.len % string_block_sizes[largest];
+    b32 allocate_end      = false;
+
+    if (rest != 0) {
+        if (rest >= string_block_sizes_thresholds[largest]) {
+            blocks += 1;
+        } else {
+            allocate_end = true;
+        }
+    }
+
+    for (isize i = 0; i < blocks; i++) {
+        if (!head) {
+            head = current = string_block_new(arena, largest, free_list);;
+        } else {
+            current = current->next = string_block_new(arena, largest, free_list);
+        }
+
+        isize pos       = (string_block_sizes[largest] * i);
+        isize remaining = s.len - pos;
+
+        isize len      = MIN(string_block_sizes[largest], remaining);
+        current->len   = len;
+        current->cap   = string_block_sizes[largest];
+        current->flags = largest;
+        memcpy(current->data, s.data + pos, cast(usize)len);
+    }
+
+    if (allocate_end) {
+        isize pos      = blocks * string_block_sizes[largest];
+        String_Set set = string_block_build(arena, (String) { .data = s.data + pos, .len = s.len - pos }, free_list);
+        current->next  = set.head;
+        current        = set.tail;
+    }
+
+    return (String_Set) { .head = head, .tail = current };
+}
+
+String_Block_Size string_block_get_size(String_Block *block) {
+    return block->flags & (STRING_BLOCK_FLAG_SIZE1 | STRING_BLOCK_FLAG_SIZE2);
+}
+
+String_Set string_block_clone(Arena *arena, String_Block *s, String_Block_Free_List free_list) {
+    String_Block *head = NULL, *current = NULL;
+
+    for (String_Block *element = s; element; element = element->next) {
+        if (!head) {
+            head = current = string_block_new(arena, string_block_get_size(element), free_list);
+        } else {
+            current = current->next = string_block_new(arena, string_block_get_size(element), free_list);
+        }
+
+        current->len   = element->len;
+        current->cap   = element->cap;
+        current->flags = element->flags;
+        memcpy(current->data, element->data, cast(usize)element->len);
+    }
+
+    return (String_Set) { .head = head, .tail = current };
+}
+
+// NOTE: String blocks are immutable, which makes this a lot easier
+String_Block *string_block_append(Arena *arena, String_Block *a, String_Block *b, String_Block_Free_List free_list) {
+    String_Set set = string_block_clone(arena, a, free_list);
+    set.tail->next = b;
+    return set.head;
+}
+
 // Basics
 
 typedef struct Context {
@@ -71,6 +209,9 @@ typedef struct Context {
     isize        alive_things;
     isize        total_things;
     struct Thing *dead_things;
+
+    Arena        strings; // NOTE: Only contains the variably sized strings, these can get quite large
+    String_Block *dead_string_blocks[STRING_BLOCK_SIZE__MAX];
 
     Arena        symbols; // NOTE: Contains both the symbol interning table and the environment table
     Symbol_Map   *symbol_map;
@@ -90,6 +231,7 @@ typedef struct Thing *(*Builtin)(Context *ctx, struct Root *root, struct Thing *
 
 typedef enum Thing_Type {
     THING_NUM,
+    THING_STRING,
     THING_CONS,
     THING_SYMBOL,
     THING_FUNCTION,
@@ -109,6 +251,7 @@ typedef struct Thing {
     b32        marked; // TODO(robin): merge into bit set, this fills up the padding so no memory actually wasted yet
     union {
         i32 num;
+        String_Block *string;
         struct {
             struct Thing *car;
             struct Thing *cdr;
@@ -174,6 +317,7 @@ typedef struct Root {
 
 
 void gc_mark_symbol_map(Context *ctx, Symbol_Map *map);
+void gc_mark_string(Context *ctx, String_Block *block);
 
 void gc_mark(Context *ctx, Thing *thing) {
     if (!thing || thing->marked /* avoid marking things more than once (avoids circular dependencies to) */) {
@@ -188,6 +332,9 @@ void gc_mark(Context *ctx, Thing *thing) {
     case THING_SYMBOL:
     case THING_BUILTIN:
     case THING_T:
+        break;
+    case THING_STRING:
+        gc_mark_string(ctx, thing->string);
         break;
     case THING_CONS:
         gc_mark(ctx, thing->cons.car);
@@ -217,6 +364,39 @@ void gc_mark_symbol_map(Context *ctx, Symbol_Map *map) {
         if (map->child[i]) {
             gc_mark_symbol_map(ctx, map->child[i]);
         }
+    }
+}
+
+void gc_mark_string(Context *ctx, String_Block *block) {
+    cast(void)ctx;
+    for (String_Block *element = block; element; element = element->next) {
+        element->flags |= STRING_BLOCK_FLAG_MARKED;
+    }
+}
+
+void gc_sweep_string(Context *ctx, String_Block *block) {
+    String_Block *element = block;
+    String_Block *previous = NULL;
+    while (element) {
+        String_Block *next = element->next;
+        if (!(element->flags & STRING_BLOCK_FLAG_MARKED)) {
+            if (previous) {
+                previous->next = next;
+            } else {
+                block = next;
+            }
+
+            String_Block_Size size = element->flags & (STRING_BLOCK_FLAG_SIZE1 | STRING_BLOCK_FLAG_SIZE2);
+            memset(element->data, 0, element->len);
+            element->next                 = ctx->dead_string_blocks[size];
+            element->len                  = 0;
+            element->flags                = size;
+            ctx->dead_string_blocks[size] = element;
+        } else {
+            element->flags &= ~STRING_BLOCK_FLAG_MARKED;
+            previous = element;
+        }
+        element = next;
     }
 }
 
@@ -279,6 +459,9 @@ void gc(Context *ctx, Root *root) {
                 symbols_maps_killed += gc_sweep_symbol_map(ctx, thing->env.vars);
 
                 goto kill;
+            case THING_STRING:
+                gc_sweep_string(ctx, thing->string);
+                goto kill;
             default:
 kill:
                 killed += 1;
@@ -325,6 +508,12 @@ Thing *thing_new(Context *ctx, Root *root, Thing_Type type) {
 Thing *thing_num(Context *ctx, Root *root, i32 num) {
     Thing *thing = thing_new(ctx, root, THING_NUM);
     thing->num = num;
+    return thing;
+}
+
+Thing *thing_string(Context *ctx, Root *root, String_Block *block) {
+    Thing *thing = thing_new(ctx, root, THING_STRING);
+    thing->string = block;
     return thing;
 }
 
@@ -392,19 +581,30 @@ Thing *thing_acons(Context *ctx, Root *root, Thing *x, Thing *y, Thing *a) {
 }
 
 Thing *thing_append(Context *ctx, Root *root, Thing *a, Thing *b) {
-    if (a == ctx->nil) {
+    ROOT_VARS3(head, tail, current);
+
+    for (current = a; current->type == THING_CONS; current = current->cons.cdr) {
+        if (!head) {
+            head = tail = thing_cons(ctx, root, current->cons.car, ctx->nil);
+        } else {
+            tail = tail->cons.cdr = thing_cons(ctx, root, current->cons.car, ctx->nil);
+        }
+    }
+
+    if (!head) {
+        if (current != ctx->nil) {
+            return thing_cons(ctx, root, current, b);
+        }
         return b;
     }
 
-    if (a->type != THING_CONS) {
-        return thing_cons(ctx, root, a, b);
+    if (current != ctx->nil) {
+        tail->cons.cdr = thing_cons(ctx, root, current, b);
+    } else {
+        tail->cons.cdr = b;
     }
 
-    ROOT_VARS2(new_car, new_cdr);
-    new_car = a->cons.car;
-    new_cdr = thing_append(ctx, root, a->cons.cdr, b);
-
-    return thing_cons(ctx, root, new_car, new_cdr);
+    return head;
 }
 
 // Printer
@@ -413,6 +613,14 @@ void print(Context *ctx, Thing *t) {
     switch (t->type) {
     case THING_NUM:
         printf("%d", t->num);
+        break;
+    case THING_STRING:
+        printf("\"");
+        for (String_Block *block = t->string; block; block = block->next) {
+            // TODO(robin): escape strings
+            printf("%.*s", cast(int)block->len, block->data);
+        }
+        printf("\"");
         break;
     case THING_CONS:
         printf("(");
@@ -471,8 +679,9 @@ typedef enum Token_Type {
     TOKEN_COMMA,
     TOKEN_COMMA_AT,
 
-    TOKEN_SYMBOL,
     TOKEN_NUM,
+    TOKEN_STRING,
+    TOKEN_SYMBOL,
 } Token_Type;
 
 typedef struct Token {
@@ -520,7 +729,7 @@ b32 is_whitespace_ch(u8 ch) {
 }
 
 b32 is_reserved_ch(u8 ch) {
-    return ch == '(' || ch == ')' || ch == ':' || ch == '.' || ch == '\'' || ch == '`' || ch == ',' || ch == '@';
+    return ch == '(' || ch == ')' || ch == ':' || ch == '.' || ch == '\'' || ch == '`' || ch == ',' || ch == '@' || ch == '"';
 }
 
 b32 is_digit(u8 ch) {
@@ -539,6 +748,26 @@ Token *parser_read_identifier(Parser *parser) {
     while (!is_reserved_ch(parser->ch) && !is_whitespace_ch(parser->ch) && parser->ch != 0) {
         parser_read_ch(parser);
     }
+
+    t.len = parser->ch_pos - 1 - t.pos;
+
+    return parser_clone_token(parser, t);
+}
+
+Token *parser_read_string(Parser *parser) {
+    Token t = { .type = TOKEN_STRING, .pos = parser->ch_pos - 1 };
+
+    parser_read_ch(parser); // skip '"'
+
+    while (!is_whitespace_ch(parser->ch) && parser->ch != 0 && parser->ch != '"') {
+        parser_read_ch(parser);
+    }
+
+    if (parser->ch != '"') {
+        fatalf("Malformed string");
+    }
+
+    parser_read_ch(parser);
 
     t.len = parser->ch_pos - 1 - t.pos;
 
@@ -582,6 +811,7 @@ Token *parser_read_token(Parser *parser) {
         }
         t.type = TOKEN_COMMA;
         break;
+    case '"': return parser_read_string(parser);
     case '-':
         if (is_digit(parser_peek_ch(parser))) {
             return parser_read_num(parser);
@@ -631,6 +861,50 @@ Thing *parser_produce_internal(Parser *parser, Root *root, String symbol) {
     return list;
 }
 
+Thing *parser_unquote_string(Parser *parser, Root *root, Token *token) {
+    String_Block *head = NULL, *tail = NULL;
+
+    String_Block_Size largest = STRING_BLOCK_SIZE_SMALL;
+    for (; string_block_sizes_thresholds[largest] < token->len && largest <= STRING_BLOCK_SIZE_HUGE; largest += 1) {}
+
+    u8 const *token_data = parser->input.data + token->pos;
+
+    for (isize i = 1; i < token->len - 1; i++) {
+        if (!head) {
+            head = tail = string_block_new(&parser->ctx->strings, largest, parser->ctx->dead_string_blocks);
+        }
+        if (tail->len >= tail->cap) {
+            tail = tail->next = string_block_new(&parser->ctx->strings, largest, parser->ctx->dead_string_blocks);
+        }
+
+        if (token_data[i] == '\\') {
+            i += 1;
+            u8 escaped = 0;
+            switch (token_data[i]) {
+                case 'n':  escaped = '\n'; break;
+                case 'r':  escaped = '\r'; break;
+                case 't':  escaped = '\t'; break;
+                case 'v':  escaped = '\v'; break;
+                case 'f':  escaped = '\f'; break;
+                case 'b':  escaped = '\b'; break;
+                case '"':  escaped = '\"'; break;
+                case '\'': escaped = '\''; break;
+                case '\\': escaped = '\\'; break;
+                default:   fatalf("Invalid escape sequence: %c\n", cast(char)token_data[i]);
+            }
+
+            tail->data[tail->len]  = escaped;
+            tail->len             += 1;
+        } else {
+            tail->data[tail->len]  = token_data[i];
+            tail->len             += 1;
+        }
+    }
+
+    parser_next_token(parser);
+    return thing_string(parser->ctx, root, head);
+}
+
 // Current token is new, ends on next new token
 Thing *parser_read(Parser *parser, Root *root) {
     Thing *simple = NULL;
@@ -640,6 +914,7 @@ Thing *parser_read(Parser *parser, Root *root) {
         fatalf("Invalid token");
     case TOKEN_EOF:
         fatalf("Unexpected EOF");
+    case TOKEN_STRING:   return parser_unquote_string(parser, root, parser->current_token);
     case TOKEN_QUOTE:    return parser_produce_internal(parser, root, STR("quote"));
     case TOKEN_BACKTICK: return parser_produce_internal(parser, root, STR("quasiquote"));
     case TOKEN_COMMA:    return parser_produce_internal(parser, root, STR("unquote"));
@@ -872,6 +1147,7 @@ Thing *macro_expand(Context *ctx, Root *root, Thing *env, Thing *t) {
 Thing *eval(Context *ctx, Root *root, Thing *env, Thing *code) {
     switch (code->type) {
     case THING_NUM:
+    case THING_STRING:
     case THING_NIL:
     case THING_FUNCTION:
     case THING_BUILTIN:

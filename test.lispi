@@ -1,3 +1,9 @@
+'(print 2 3)
+
+(print (list 'you 'hate 'me '?))
+
+(print "hi\n")
+
 (deffun xd () 'xd)
 
 (print (xd))
