@@ -374,8 +374,8 @@ void gc_mark_string(Context *ctx, String_Block *block) {
     }
 }
 
-void gc_sweep_string(Context *ctx, String_Block *block) {
-    String_Block *element = block;
+void gc_sweep_string(Context *ctx, String_Block **block_ptr) {
+    String_Block *element = *block_ptr;
     String_Block *previous = NULL;
     while (element) {
         String_Block *next = element->next;
@@ -383,7 +383,7 @@ void gc_sweep_string(Context *ctx, String_Block *block) {
             if (previous) {
                 previous->next = next;
             } else {
-                block = next;
+                *block_ptr = next;
             }
 
             String_Block_Size size = element->flags & (STRING_BLOCK_FLAG_SIZE1 | STRING_BLOCK_FLAG_SIZE2);
@@ -460,7 +460,7 @@ void gc(Context *ctx, Root *root) {
 
                 goto kill;
             case THING_STRING:
-                gc_sweep_string(ctx, thing->string);
+                gc_sweep_string(ctx, &thing->string);
                 goto kill;
             default:
 kill:
@@ -759,7 +759,7 @@ Token *parser_read_string(Parser *parser) {
 
     parser_read_ch(parser); // skip '"'
 
-    while (!is_whitespace_ch(parser->ch) && parser->ch != 0 && parser->ch != '"') {
+    while (parser->ch != 0 && parser->ch != '"') {
         parser_read_ch(parser);
     }
 
@@ -1430,7 +1430,7 @@ Thing *builtin_car(Context *ctx, Root *root, Thing *env, Thing *args) {
     if (evaluated_args->cons.car->type != THING_CONS || evaluated_args->cons.cdr != ctx->nil) {
         fatalf("Malformed car");
     }
-    return args->cons.car->cons.car;
+    return evaluated_args->cons.car->cons.car;
 }
 
 Thing *builtin_cdr(Context *ctx, Root *root, Thing *env, Thing *args) {
@@ -1438,7 +1438,7 @@ Thing *builtin_cdr(Context *ctx, Root *root, Thing *env, Thing *args) {
     if (evaluated_args->cons.car->type != THING_CONS || evaluated_args->cons.cdr != ctx->nil) {
         fatalf("Malformed cdr");
     }
-    return args->cons.car->cons.cdr;
+    return evaluated_args->cons.car->cons.cdr;
 }
 
 Thing *builtin_setq(Context *ctx, Root *root, Thing *env, Thing *args) {
@@ -1468,7 +1468,7 @@ Thing *builtin_setcar(Context *ctx, Root *root, Thing *env, Thing *args) {
     if (list_length(ctx, evaluated_args) != 2 || evaluated_args->cons.car->type != THING_CONS) {
         fatalf("Malformed setcar");
     }
-    evaluated_args->cons.car->cons.car = evaluated_args->cons.cdr;
+    evaluated_args->cons.car->cons.car = evaluated_args->cons.cdr->cons.car;
     return evaluated_args->cons.car;
 }
 

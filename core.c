@@ -118,7 +118,7 @@ String arena_clone_from_cstr(Arena *arena, char const *cstr) {
 }
 
 void arena_reset_to(Arena *arena, usize pos) {
-    Arena_Block *block = arena->current;
+    Arena_Block *block = arena->first;
 
     for (; block && pos > block->len; block = block->next) {
         pos -= block->len;
@@ -133,6 +133,8 @@ void arena_reset_to(Arena *arena, usize pos) {
         memset(cast(void*)(cast(uintptr)block->memory + pos), 0, block->len - pos);
         block->len = pos;
     }
+
+    arena->current = block;
 
     Arena_Block *current_block = block->next;
     block->next                = NULL;
