@@ -1149,6 +1149,7 @@ Thing *eval(Context *ctx, Root *root, Thing *env, Thing *code) {
     case THING_NUM:
     case THING_STRING:
     case THING_NIL:
+    case THING_T:
     case THING_FUNCTION:
     case THING_BUILTIN:
         return code;
