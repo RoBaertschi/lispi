@@ -287,7 +287,7 @@ gc_mark :: proc(ctx: ^Context, thing: ^Thing) {
         break
 
     case .String:
-        // TODO(robin): gc mark string
+        gc_mark_string(ctx, thing.str)
     case .Cons:
         gc_mark(ctx, thing.cons.car)
         gc_mark(ctx, thing.cons.cdr)
@@ -347,6 +347,7 @@ gc :: proc(ctx: ^Context, root: ^Root) {
 
         for &thing in things {
             if thing.info.marked {
+                thing.info.marked = false
                 continue
             }
 
@@ -564,7 +565,7 @@ print :: proc(ctx: ^Context, t: ^Thing) {
         fmt.print("\"")
         for block := t.str; block != nil; block = block.next {
             #no_bounds_check {
-                fmt.print(block.data[:block.len])
+                fmt.print(string(block.data[:block.len]))
             }
         }
         fmt.print("\"")
@@ -713,7 +714,7 @@ parser_read_string :: proc(parser: ^Parser) -> (t: Token) {
 
 
 parser_read_num :: proc(parser: ^Parser) -> (t: Token) {
-    t.type = .Symbol
+    t.type = .Num
     t.pos  = parser.ch_pos - 1
 
     if parser.ch == '-' {
@@ -789,6 +790,7 @@ parser_produce_internal :: proc(parser: ^Parser, root: ^Root, symbol: string) ->
     root := root
     list, sym: ^Thing
     root, _ = root_new_guard(root, &list, &sym)
+    parser_next_token(parser)
     sym     = thing_symbol_intern(parser.ctx, root, symbol)
     list    = parser_read(parser, root)
     list    = thing_cons(parser.ctx, root, list, parser.ctx.nil_)
@@ -836,10 +838,14 @@ parser_unqoute_string :: proc(parser: ^Parser, root: ^Root, token: Token) -> ^Th
             case:      fatalf("Invalid escape sequence: %r", rune(token_data[i]))
             }
 
-            tail.data[tail.len]  = escaped
+            #no_bounds_check {
+                tail.data[tail.len] = escaped
+            }
             tail.len            += 1
         } else {
-            tail.data[tail.len]  = token_data[i]
+            #no_bounds_check {
+                tail.data[tail.len] = token_data[i]
+            }
             tail.len            += 1
         }
     }
@@ -872,7 +878,7 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
         }
 
         start, head, current, t: ^Thing
-        root, _ = root_new_guard(root, &start, &head, &current)
+        root, _ = root_new_guard(root, &start, &head, &current, &t)
 
         start = parser_read(parser, root)
         if parser.current_token.type == .Dot {
@@ -892,6 +898,7 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
         for parser.current_token.type != .PClose {
             t                = parser_read(parser, root)
             current.cons.cdr = thing_cons(parser.ctx, root, t, parser.ctx.nil_)
+            current          = current.cons.cdr
         }
         parser_next_token(parser)
         return head
@@ -1000,10 +1007,10 @@ env_from_lists :: proc(ctx: ^Context, root: ^Root, env, keys, values: ^Thing) ->
 
 env_add_builtin :: proc(ctx: ^Context, root: ^Root, env : ^Thing, name: string, builtin: Thing_Builtin) {
     root := root
-    sym, builtin_thing: ^Thing
-    root, _        = root_new_guard(root, &sym, &builtin_thing)
+    builtin_thing: ^Thing
+    root, _        = root_new_guard(root, &builtin_thing)
     builtin_thing  = thing_builtin(ctx, root, builtin)
-    symbol        := symbol_map_upsert_free_list(&env.env.vars, sym.symbol, &ctx.dead_envs, &ctx.symbols)
+    symbol        := symbol_map_upsert_free_list(&env.env.vars, name, &ctx.dead_envs, &ctx.symbols)
     symbol.thing   = builtin_thing
 }
 
@@ -1089,12 +1096,7 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
     root := root
 
     switch code.info.type {
-    case .Num:
-    case .String:
-    case .Nil:
-    case .T:
-    case .Function:
-    case .Builtin:
+    case .Num, .String, .Nil, .T, .Function, .Builtin:
         return code
     case .Cons:
         expanded, fn, args: ^Thing
@@ -1106,7 +1108,7 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
 
         fn   = eval(ctx, root, env, expanded.cons.car)
         args = expanded.cons.cdr
-        if fn.info.type != .Builtin || fn.info.type != .Function {
+        if fn.info.type != .Builtin && fn.info.type != .Function {
             fatalf("eval: Expected function to call, got %v", fn.info.type)
         }
         return apply(ctx, root, env, fn, args)
@@ -1205,7 +1207,7 @@ handle_cmp :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, $op: Cmp_Opera
         fatalf("cmp: Exactly 2 arguments are required")
     }
 
-    if evaluated_args.cons.car.info.type == .Num || evaluated_args.cons.cdr.cons.car.info.type == .Num {
+    if evaluated_args.cons.car.info.type != .Num || evaluated_args.cons.cdr.cons.car.info.type != .Num {
         fatalf("cmp: Arguments have to be nums")
     }
 
@@ -1363,6 +1365,109 @@ builtin_quasiquote :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Th
     return quasiquote_expand(ctx, root, env, args.cons.car)
 }
 
+builtin_cons :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    if list_length(ctx, args) != 2 {
+        fatalf("cons: Exactly 2 arguments required")
+    }
+    cell := eval_list(ctx, root, env, args)
+    cell.cons.cdr = cell.cons.cdr.cons.car
+    return cell
+}
+
+builtin_car :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    evaluated_args := eval_list(ctx, root, env, args)
+    if evaluated_args.cons.car.info.type != .Cons || evaluated_args.cons.cdr != ctx.nil_ {
+        fatalf("car: Expected a single cons argument")
+    }
+    return evaluated_args.cons.car.cons.car
+}
+
+builtin_cdr :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    evaluated_args := eval_list(ctx, root, env, args)
+    if evaluated_args.cons.car.info.type != .Cons || evaluated_args.cons.cdr != ctx.nil_ {
+        fatalf("cdr: Expected a single cons argument")
+    }
+    return evaluated_args.cons.car.cons.cdr
+}
+
+builtin_list :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    return eval_list(ctx, root, env, args)
+}
+
+builtin_setq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    root := root
+
+    if list_length(ctx, args) != 2 || args.cons.car.info.type != .Symbol {
+        fatalf("setq: Malformed setq")
+    }
+
+    value: ^Thing
+    root, _ = root_new_guard(root, &value)
+    bind_symbol := env_find_or_create_symbol(ctx, env, args.cons.car)
+    value = eval(ctx, root, env, args.cons.cdr.cons.car)
+    bind_symbol.thing = value
+    return value
+}
+
+builtin_setcar :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    root := root
+    evaluated_args: ^Thing
+    root, _ = root_new_guard(root, &evaluated_args)
+    evaluated_args = eval_list(ctx, root, env, args)
+    if list_length(ctx, evaluated_args) != 2 || evaluated_args.cons.car.info.type != .Cons {
+        fatalf("setcar: Expected a cons and a value")
+    }
+    evaluated_args.cons.car.cons.car = evaluated_args.cons.cdr.cons.car
+    return evaluated_args.cons.car
+}
+
+builtin_while :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    root := root
+
+    if list_length(ctx, args) < 2 {
+        fatalf("while: Malformed while")
+    }
+
+    cond: ^Thing
+    root, _ = root_new_guard(root, &cond)
+    cond = args.cons.car
+    for eval(ctx, root, env, cond) != ctx.nil_ {
+        progn(ctx, root, env, args.cons.cdr)
+    }
+
+    return ctx.nil_
+}
+
+builtin_gensym :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    name := fmt.tprintf("G__%d", ctx.gen_symbol_counter)
+    ctx.gen_symbol_counter += 1
+    return thing_symbol(ctx, root, name)
+}
+
+builtin_print :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    root := root
+    evaluated_args: ^Thing
+    root, _ = root_new_guard(root, &evaluated_args)
+    evaluated_args = eval_list(ctx, root, env, args)
+    for tmp := evaluated_args; tmp.info.type == .Cons; tmp = tmp.cons.cdr {
+        print(ctx, tmp.cons.car)
+        fmt.println()
+    }
+    return ctx.nil_
+}
+
+builtin_thing_eq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    if list_length(ctx, args) != 2 {
+        fatalf("eq: Exactly 2 arguments required")
+    }
+    values := eval_list(ctx, root, env, args)
+    return values.cons.car == values.cons.cdr.cons.car ? ctx.t : ctx.nil_
+}
+
+builtin_gc :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+    gc(ctx, root)
+    return ctx.nil_
+}
 
 ctx_init :: proc(ctx: ^Context, root: ^Root) {
     root := root
@@ -1378,13 +1483,32 @@ ctx_init :: proc(ctx: ^Context, root: ^Root) {
 
     env_add_variable(ctx, ctx.env, tmp, ctx.t)
 
-    env_add_builtin(ctx, root, ctx.env, "+", builtin_add)
-    env_add_builtin(ctx, root, ctx.env, "-", builtin_sub)
-    env_add_builtin(ctx, root, ctx.env, "*", builtin_mul)
-    env_add_builtin(ctx, root, ctx.env, "/", builtin_div)
-    env_add_builtin(ctx, root, ctx.env, "<", builtin_lt)
-    env_add_builtin(ctx, root, ctx.env, ">", builtin_gt)
-    env_add_builtin(ctx, root, ctx.env, "=", builtin_eq)
+    env_add_builtin(ctx, root, ctx.env, "+",           builtin_add)
+    env_add_builtin(ctx, root, ctx.env, "-",           builtin_sub)
+    env_add_builtin(ctx, root, ctx.env, "*",           builtin_mul)
+    env_add_builtin(ctx, root, ctx.env, "/",           builtin_div)
+    env_add_builtin(ctx, root, ctx.env, "<",           builtin_lt)
+    env_add_builtin(ctx, root, ctx.env, ">",           builtin_gt)
+    env_add_builtin(ctx, root, ctx.env, "=",           builtin_eq)
+    env_add_builtin(ctx, root, ctx.env, "lambda",      builtin_lambda)
+    env_add_builtin(ctx, root, ctx.env, "deffun",      builtin_deffun)
+    env_add_builtin(ctx, root, ctx.env, "defmacro",    builtin_defmacro)
+    env_add_builtin(ctx, root, ctx.env, "define",      builtin_define)
+    env_add_builtin(ctx, root, ctx.env, "progn",       builtin_progn)
+    env_add_builtin(ctx, root, ctx.env, "macroexpand", builtin_macroexpand)
+    env_add_builtin(ctx, root, ctx.env, "quote",       builtin_quote)
+    env_add_builtin(ctx, root, ctx.env, "quasiquote",  builtin_quasiquote)
+    env_add_builtin(ctx, root, ctx.env, "cons",        builtin_cons)
+    env_add_builtin(ctx, root, ctx.env, "car",         builtin_car)
+    env_add_builtin(ctx, root, ctx.env, "cdr",         builtin_cdr)
+    env_add_builtin(ctx, root, ctx.env, "list",        builtin_list)
+    env_add_builtin(ctx, root, ctx.env, "setq",        builtin_setq)
+    env_add_builtin(ctx, root, ctx.env, "setcar",      builtin_setcar)
+    env_add_builtin(ctx, root, ctx.env, "while",       builtin_while)
+    env_add_builtin(ctx, root, ctx.env, "gensym",      builtin_gensym)
+    env_add_builtin(ctx, root, ctx.env, "print",       builtin_print)
+    env_add_builtin(ctx, root, ctx.env, "eq",          builtin_thing_eq)
+    env_add_builtin(ctx, root, ctx.env, "gc",          builtin_gc)
 }
 
 ctx_destroy :: proc(ctx: ^Context) {
@@ -1395,6 +1519,7 @@ ctx_destroy :: proc(ctx: ^Context) {
 }
 
 main :: proc() {
+    context.logger = log.create_console_logger()
     args := os.args
 
     if len(args) < 2 {
@@ -1413,7 +1538,7 @@ main :: proc() {
         result: ^Thing
         root, _ = root_new_guard(root, &result)
 
-ctx_init(&ctx, root)
+        ctx_init(&ctx, root)
         defer ctx_destroy(&ctx)
 
         parser: Parser
