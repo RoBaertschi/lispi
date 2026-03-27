@@ -13,8 +13,6 @@ fatalf :: proc(fmt: string, args: ..any) -> ! {
     os.exit(1)
 }
 
-// Builtins
-
 ctx_init :: proc(ctx: ^Context, root: ^Root) {
     root := root
 
