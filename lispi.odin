@@ -1093,17 +1093,25 @@ macro_expand :: proc(ctx: ^Context, root: ^Root, env, t: ^Thing) -> ^Thing {
 }
 
 eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
-    root := root
-
-    switch code.info.type {
-    case .Num, .String, .Nil, .T, .Function, .Builtin:
+    eval_self :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         return code
-    case .Cons:
+    }
+
+    eval_error :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+        fatalf("eval: Invalid thing type: %v", code.info.type)
+    }
+
+    eval_cons :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+        root := root
+        temp := temp_allocator_get({})
         expanded, fn, args: ^Thing
-        root, _ = root_new_guard(root, &expanded, &fn, &args)
+        evaluated_args, new_env: ^Thing
+        root = root_new(temp, root, &expanded, &fn, &args, &evaluated_args, &new_env)
+
         expanded = macro_expand(ctx, root, env, code)
         if expanded != code {
-            return eval(ctx, root, env, expanded)
+            temp_allocator_end(temp.tmp, temp.loc)
+            return #must_tail eval(ctx, root, env, expanded)
         }
 
         fn   = eval(ctx, root, env, expanded.cons.car)
@@ -1111,18 +1119,41 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         if fn.info.type != .Builtin && fn.info.type != .Function {
             fatalf("eval: Expected function to call, got %v", fn.info.type)
         }
-        return apply(ctx, root, env, fn, args)
-    case .Symbol:
+
+        if fn.info.type == .Builtin {
+            return fn.builtin(ctx, root, env, args)
+        }
+
+        evaluated_args = eval_list(ctx, root, env, args)
+        new_env        = env_from_lists(ctx, root, fn.function.env, fn.function.params, evaluated_args)
+
+        temp_allocator_end(temp.tmp, temp.loc)
+        return progn(ctx, root, new_env, fn.function.code)
+    }
+
+    eval_symbol :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         t := env_find(ctx, env, code)
         if t == nil {
             fatalf("eval: Could not find symbol: %s", code.symbol)
         }
         return t
-    case .Dead, .Env, .Macro:
-        fatalf("eval: Invalid thing type: %v", code.info.type)
     }
 
-    unreachable()
+    @(static, rodata) LUT := [Thing_Type](#type proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing){
+        .Num = eval_self,
+        .String = eval_self,
+        .Nil = eval_self,
+        .T = eval_self,
+        .Function = eval_self,
+        .Builtin = eval_self,
+        .Cons = eval_cons,
+        .Symbol = eval_symbol,
+        .Dead = eval_error,
+        .Env = eval_error,
+        .Macro = eval_error,
+    }
+
+    return #must_tail LUT[code.info.type](ctx, root, env, code)
 }
 
 // Builtins
