@@ -11,7 +11,7 @@ Math_Operator :: enum {
     Div,
 }
 
-handle_math :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, $op: Math_Operator) -> ^Thing {
+handle_math :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing, $op: Math_Operator) -> ^Thing {
     root := root
 
     evaluated_args, num: ^Thing
@@ -52,17 +52,17 @@ handle_math :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, $op: Math_Ope
     return thing_num(ctx, root, result)
 }
 
-builtin_add :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_add :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_math(ctx, root, env, args, .Add)
 }
-builtin_sub :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_sub :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_math(ctx, root, env, args, .Sub)
 }
 
-builtin_mul :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_mul :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_math(ctx, root, env, args, .Mul)
 }
-builtin_div :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_div :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_math(ctx, root, env, args, .Div)
 }
 
@@ -73,7 +73,7 @@ Cmp_Operator :: enum {
     EQ,
 }
 
-handle_cmp :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, $op: Cmp_Operator) -> (result: ^Thing) {
+handle_cmp :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing, $op: Cmp_Operator) -> (result: ^Thing) {
     root := root
 
     evaluated_args := eval_list(ctx, root, env, args)
@@ -102,11 +102,11 @@ handle_cmp :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, $op: Cmp_Opera
     return result
 }
 
-builtin_lt :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .LT) }
-builtin_gt :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .GT) }
-builtin_eq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .EQ) }
+builtin_lt :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .LT) }
+builtin_gt :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .GT) }
+builtin_eq :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing { return handle_cmp(ctx, root, env, args, .EQ) }
 
-handle_function :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, type: Thing_Type, $builtin_name: string) -> ^Thing {
+handle_function :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing, type: Thing_Type, $builtin_name: string) -> ^Thing {
     root := root
 
     if args.info.type != .Cons || !is_list(ctx, args.cons.car) {
@@ -140,11 +140,11 @@ handle_function :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, type: Thi
     return thing_function(ctx, root, params, code, env, type)
 }
 
-builtin_lambda :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_lambda :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_function(ctx, root, env, args, .Function, "lambda")
 }
 
-handle_deffun :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, type: Thing_Type, $builtin_name: string) -> ^Thing {
+handle_deffun :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing, type: Thing_Type, $builtin_name: string) -> ^Thing {
     root := root
     fn_sym, fn_args, fn: ^Thing
 
@@ -162,16 +162,16 @@ handle_deffun :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing, type: Thing
     return fn
 }
 
-builtin_deffun :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_deffun :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_deffun(ctx, root, env, args, .Function, "deffun")
 }
 
-builtin_defmacro :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_defmacro :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return handle_deffun(ctx, root, env, args, .Macro, "defmacro")
 }
 
 
-builtin_define :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_define :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     root := root
 
     if list_length(ctx, args) != 2 || args.cons.car.info.type != .Symbol {
@@ -187,11 +187,11 @@ builtin_define :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing 
     return value
 }
 
-builtin_progn :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_progn :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return progn(ctx, root, env, args)
 }
 
-builtin_macroexpand :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_macroexpand :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     if list_length(ctx, args) != 1 {
         fatalf("macroexpand: Only accept one argument")
     }
@@ -199,7 +199,7 @@ builtin_macroexpand :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^T
     return macro_expand(ctx, root, env, args.cons.car)
 }
 
-builtin_quote :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_quote :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     if list_length(ctx, args) != 1 {
         fatalf("quote: Only accept one argument")
     }
@@ -207,7 +207,7 @@ builtin_quote :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return args.cons.car
 }
 
-quasiquote_expand :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> ^Thing {
+quasiquote_expand :: proc(ctx: ^Runtime_Context, root: ^Root, env, list: ^Thing) -> ^Thing {
     root := root
     if (list.info.type != .Cons) {
         return list
@@ -234,7 +234,7 @@ quasiquote_expand :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> ^Thi
     return thing_cons(ctx, root, sym, rest)
 }
 
-builtin_quasiquote :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_quasiquote :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     if args == ctx.nil_ {
         return ctx.nil_
     }
@@ -242,7 +242,7 @@ builtin_quasiquote :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Th
     return quasiquote_expand(ctx, root, env, args.cons.car)
 }
 
-builtin_cons :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_cons :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     if list_length(ctx, args) != 2 {
         fatalf("cons: Exactly 2 arguments required")
     }
@@ -251,7 +251,7 @@ builtin_cons :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return cell
 }
 
-builtin_car :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_car :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     evaluated_args := eval_list(ctx, root, env, args)
     if evaluated_args.cons.car.info.type != .Cons || evaluated_args.cons.cdr != ctx.nil_ {
         fatalf("car: Expected a single cons argument")
@@ -259,7 +259,7 @@ builtin_car :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return evaluated_args.cons.car.cons.car
 }
 
-builtin_cdr :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_cdr :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     evaluated_args := eval_list(ctx, root, env, args)
     if evaluated_args.cons.car.info.type != .Cons || evaluated_args.cons.cdr != ctx.nil_ {
         fatalf("cdr: Expected a single cons argument")
@@ -267,11 +267,11 @@ builtin_cdr :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return evaluated_args.cons.car.cons.cdr
 }
 
-builtin_list :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_list :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return eval_list(ctx, root, env, args)
 }
 
-builtin_setq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_setq :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     root := root
 
     if list_length(ctx, args) != 2 || args.cons.car.info.type != .Symbol {
@@ -286,7 +286,7 @@ builtin_setq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return value
 }
 
-builtin_setcar :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_setcar :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     root := root
     evaluated_args: ^Thing
     root, _ = root_new_guard(root, &evaluated_args)
@@ -298,7 +298,7 @@ builtin_setcar :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing 
     return evaluated_args.cons.car
 }
 
-builtin_while :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_while :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     root := root
 
     if list_length(ctx, args) < 2 {
@@ -315,13 +315,13 @@ builtin_while :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return ctx.nil_
 }
 
-builtin_gensym :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_gensym :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     name := fmt.tprintf("G__%d", ctx.gen_symbol_counter)
     ctx.gen_symbol_counter += 1
     return thing_symbol(ctx, root, name)
 }
 
-builtin_print :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_print :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     root := root
     evaluated_args: ^Thing
     root, _ = root_new_guard(root, &evaluated_args)
@@ -333,7 +333,7 @@ builtin_print :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     return ctx.nil_
 }
 
-builtin_thing_eq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_thing_eq :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     if list_length(ctx, args) != 2 {
         fatalf("eq: Exactly 2 arguments required")
     }
@@ -341,12 +341,41 @@ builtin_thing_eq :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thin
     return values.cons.car == values.cons.cdr.cons.car ? ctx.t : ctx.nil_
 }
 
-builtin_gc :: proc(ctx: ^Context, root: ^Root, env, args: ^Thing) -> ^Thing {
+builtin_gc :: proc(ctx: ^Runtime_Context, root: ^Root, env, args: ^Thing) -> ^Thing {
     gc(ctx, root)
     return ctx.nil_
 }
 
-ctx_init_builtins :: proc(ctx: ^Context, root: ^Root) {
+builtins := []struct{ name: string, builtin: Thing_Builtin } {
+    { "+",           builtin_add, },
+    { "-",           builtin_sub, },
+    { "*",           builtin_mul, },
+    { "/",           builtin_div, },
+    { "<",           builtin_lt, },
+    { ">",           builtin_gt, },
+    { "=",           builtin_eq, },
+    { "lambda",      builtin_lambda, },
+    { "deffun",      builtin_deffun, },
+    { "defmacro",    builtin_defmacro, },
+    { "define",      builtin_define, },
+    { "progn",       builtin_progn, },
+    { "macroexpand", builtin_macroexpand, },
+    { "quote",       builtin_quote, },
+    { "quasiquote",  builtin_quasiquote, },
+    { "cons",        builtin_cons, },
+    { "car",         builtin_car, },
+    { "cdr",         builtin_cdr, },
+    { "list",        builtin_list, },
+    { "setq",        builtin_setq, },
+    { "setcar",      builtin_setcar, },
+    { "while",       builtin_while, },
+    { "gensym",      builtin_gensym, },
+    { "print",       builtin_print, },
+    { "eq",          builtin_thing_eq, },
+    { "gc",          builtin_gc, },
+}
+
+ctx_init_builtins :: proc(ctx: ^Runtime_Context, root: ^Root) {
     env_add_builtin(ctx, root, ctx.env, "+",           builtin_add)
     env_add_builtin(ctx, root, ctx.env, "-",           builtin_sub)
     env_add_builtin(ctx, root, ctx.env, "*",           builtin_mul)

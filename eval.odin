@@ -1,11 +1,11 @@
 package lispi
 
 
-is_list :: proc(ctx: ^Context, t: ^Thing) -> bool {
+is_list :: proc(ctx: ^Runtime_Context, t: ^Thing) -> bool {
     return t == ctx.nil_ || t.info.type == .Cons
 }
 
-list_length :: proc(ctx: ^Context, t: ^Thing) -> (len: int) {
+list_length :: proc(ctx: ^Runtime_Context, t: ^Thing) -> (len: int) {
     t := t
 
     for {
@@ -22,7 +22,7 @@ list_length :: proc(ctx: ^Context, t: ^Thing) -> (len: int) {
     }
 }
 
-env_find :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Thing {
+env_find :: proc(ctx: ^Runtime_Context, env, sym: ^Thing) -> ^Thing {
     env := env
     for ; env != ctx.nil_; env = env.env.parent {
         symbol := symbol_map_find(&env.env.vars, sym.symbol)
@@ -34,7 +34,7 @@ env_find :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Thing {
     return nil
 }
 
-env_find_symbol :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Symbol {
+env_find_symbol :: proc(ctx: ^Runtime_Context, env, sym: ^Thing) -> ^Symbol {
     env := env
     for ; env != ctx.nil_; env = env.env.parent {
         symbol := symbol_map_find(&env.env.vars, sym.symbol)
@@ -46,7 +46,7 @@ env_find_symbol :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Symbol {
     return nil
 }
 
-env_find_or_create_symbol :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Symbol {
+env_find_or_create_symbol :: proc(ctx: ^Runtime_Context, env, sym: ^Thing) -> ^Symbol {
     for iter_env := env ; iter_env != ctx.nil_; iter_env = iter_env.env.parent {
         symbol := symbol_map_find(&iter_env.env.vars, sym.symbol)
         if symbol != nil {
@@ -59,7 +59,7 @@ env_find_or_create_symbol :: proc(ctx: ^Context, env, sym: ^Thing) -> ^Symbol {
     return symbol
 }
 
-env_from_lists :: proc(ctx: ^Context, root: ^Root, env, keys, values: ^Thing) -> ^Thing {
+env_from_lists :: proc(ctx: ^Runtime_Context, root: ^Root, env, keys, values: ^Thing) -> ^Thing {
     root := root
     vars: ^Symbol_Map
     k, v := keys, values
@@ -84,7 +84,7 @@ env_from_lists :: proc(ctx: ^Context, root: ^Root, env, keys, values: ^Thing) ->
     return thing_env(ctx, root, env, vars)
 }
 
-env_add_builtin :: proc(ctx: ^Context, root: ^Root, env : ^Thing, name: string, builtin: Thing_Builtin) {
+env_add_builtin :: proc(ctx: ^Runtime_Context, root: ^Root, env : ^Thing, name: string, builtin: Thing_Builtin) {
     root := root
     builtin_thing: ^Thing
     root, _        = root_new_guard(root, &builtin_thing)
@@ -93,12 +93,12 @@ env_add_builtin :: proc(ctx: ^Context, root: ^Root, env : ^Thing, name: string, 
     symbol.thing   = builtin_thing
 }
 
-env_add_variable :: proc(ctx: ^Context, env, key, value: ^Thing) {
+env_add_variable :: proc(ctx: ^Runtime_Context, env, key, value: ^Thing) {
     symbol       := symbol_map_upsert_free_list(&env.env.vars, key.symbol, &ctx.dead_envs, &ctx.symbols)
     symbol.thing  = value
 }
 
-eval_list :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> ^Thing {
+eval_list :: proc(ctx: ^Runtime_Context, root: ^Root, env, list: ^Thing) -> ^Thing {
     root := root
     head, current, t, element: ^Thing
     root, _ = root_new_guard(root, &head, &current, &t, &element)
@@ -121,7 +121,7 @@ eval_list :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> ^Thing {
     return head
 }
 
-apply :: proc(ctx: ^Context, root: ^Root, env, fn, args: ^Thing) -> ^Thing {
+apply :: proc(ctx: ^Runtime_Context, root: ^Root, env, fn, args: ^Thing) -> ^Thing {
     root := root
     if !is_list(ctx, args) {
         fatalf("apply: args must be a list")
@@ -140,7 +140,7 @@ apply :: proc(ctx: ^Context, root: ^Root, env, fn, args: ^Thing) -> ^Thing {
     return progn(ctx, root, new_env, fn.function.code)
 }
 
-progn :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> (result: ^Thing) {
+progn :: proc(ctx: ^Runtime_Context, root: ^Root, env, list: ^Thing) -> (result: ^Thing) {
     root := root
     element: ^Thing
     root, _ = root_new_guard(root, &result, &element)
@@ -150,7 +150,7 @@ progn :: proc(ctx: ^Context, root: ^Root, env, list: ^Thing) -> (result: ^Thing)
     return result
 }
 
-macro_expand :: proc(ctx: ^Context, root: ^Root, env, t: ^Thing) -> ^Thing {
+macro_expand :: proc(ctx: ^Runtime_Context, root: ^Root, env, t: ^Thing) -> ^Thing {
     root := root
 
     if t.info.type != .Cons || t.cons.car.info.type != .Symbol {
@@ -171,16 +171,16 @@ macro_expand :: proc(ctx: ^Context, root: ^Root, env, t: ^Thing) -> ^Thing {
     return progn(ctx, root, new_env, macro.function.code)
 }
 
-eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
-    eval_self :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+eval :: proc(ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+    eval_self :: proc (ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         return code
     }
 
-    eval_error :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+    eval_error :: proc (ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         fatalf("eval: Invalid thing type: %v", code.info.type)
     }
 
-    eval_cons :: proc (ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+    eval_cons :: proc (ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         root := root
         temp := temp_allocator_get({})
         expanded, fn, args: ^Thing
@@ -210,7 +210,7 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         return progn(ctx, root, new_env, fn.function.code)
     }
 
-    eval_symbol :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
+    eval_symbol :: proc(ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         t := env_find(ctx, env, code)
         if t == nil {
             fatalf("eval: Could not find symbol: %s", code.symbol)
@@ -218,7 +218,7 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         return t
     }
 
-    @(static, rodata) LUT := [Thing_Type](#type proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing){
+    @(static, rodata) LUT := [Thing_Type](#type proc(ctx: ^Runtime_Context, root: ^Root, env, code: ^Thing) -> ^Thing){
         .Num = eval_self,
         .String = eval_self,
         .Nil = eval_self,
@@ -230,6 +230,8 @@ eval :: proc(ctx: ^Context, root: ^Root, env, code: ^Thing) -> ^Thing {
         .Dead = eval_error,
         .Env = eval_error,
         .Macro = eval_error,
+        .Constant_String = eval_error,
+        .Constant_Symbol = eval_error,
     }
 
     return #must_tail LUT[code.info.type](ctx, root, env, code)

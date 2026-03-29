@@ -13,7 +13,7 @@ fatalf :: proc(fmt: string, args: ..any) -> ! {
     os.exit(1)
 }
 
-ctx_init :: proc(ctx: ^Context, root: ^Root) {
+ctx_init :: proc(ctx: ^Runtime_Context, root: ^Root) {
     root := root
 
     ctx.gc_things_threshold = 32
@@ -30,7 +30,7 @@ ctx_init :: proc(ctx: ^Context, root: ^Root) {
     ctx_init_builtins(ctx, root)
 }
 
-ctx_destroy :: proc(ctx: ^Context) {
+ctx_destroy :: proc(ctx: ^Runtime_Context) {
     virtual.arena_destroy(&ctx.things)
     virtual.arena_destroy(&ctx.symbols)
     virtual.arena_destroy(&ctx.strings)
@@ -45,32 +45,42 @@ main :: proc() {
         fatalf("Missing arguments. Required at least one.\n")
     }
 
-    data, err := os.read_entire_file(args[1], context.allocator)
+    // data, err := os.read_entire_file(args[1], context.allocator)
+    // if err != nil {
+    //     fatalf("Could not read file %q: %v", args[1], err)
+    // }
+    // defer delete(data)
+    //
+    // {
+    //     ctx: Runtime_Context
+    //     root: ^Root
+    //     result: ^Thing
+    //     root, _ = root_new_guard(root, &result)
+    //
+    //     ctx_init(&ctx, root)
+    //     defer ctx_destroy(&ctx)
+    //
+    //     parser: Parser
+    //     parser_init(&parser, &ctx, string(data))
+    //     defer parser_destroy(&parser)
+    //
+    //     for parser.current_token.type != .EOF {
+    //         result = parser_read(&parser, root)
+    //         result = eval(&ctx, root, ctx.env, result)
+    //     }
+    //
+    //     when GC_DEBUG {
+    //         log.debugf("Alive/Total things: %d/%d", ctx.alive_things, ctx.total_things)
+    //     }
+    // }
+
+    c, err := compile(args[1])
+
     if err != nil {
-        fatalf("Could not read file %q: %v", args[1], err)
+        log.errorf("OS Error: %v", err)
     }
-    defer delete(data)
 
-    {
-        ctx: Context
-        root: ^Root
-        result: ^Thing
-        root, _ = root_new_guard(root, &result)
-
-        ctx_init(&ctx, root)
-        defer ctx_destroy(&ctx)
-
-        parser: Parser
-        parser_init(&parser, &ctx, string(data))
-        defer parser_destroy(&parser)
-
-        for parser.current_token.type != .EOF {
-            result = parser_read(&parser, root)
-            result = eval(&ctx, root, ctx.env, result)
-        }
-
-        when GC_DEBUG {
-            log.debugf("Alive/Total things: %d/%d", ctx.alive_things, ctx.total_things)
-        }
+    if c.errors > 0 {
+        log.errorf("Could not compile package %q", args[1])
     }
 }

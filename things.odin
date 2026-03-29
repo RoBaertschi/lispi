@@ -107,7 +107,7 @@ String_Block :: struct {
 
 String_Block_Free_List :: [String_Block_Size]^String_Block
 
-string_block_new :: proc(arena: ^virtual.Arena, size: String_Block_Size, free_list: ^String_Block_Free_List) -> (block: ^String_Block) {
+string_block_new_with_freelist :: proc(arena: ^virtual.Arena, size: String_Block_Size, free_list: ^String_Block_Free_List) -> (block: ^String_Block) {
 
     if free_list[size] != nil {
         block           = free_list[size]
@@ -122,6 +122,21 @@ string_block_new :: proc(arena: ^virtual.Arena, size: String_Block_Size, free_li
     block.cap  = string_block_sizes[size]
     block.info = { size = size }
     return block
+}
+
+string_block_new_without_freelist :: proc(arena: ^virtual.Arena, size: String_Block_Size) -> (block: ^String_Block) {
+    data, _ := virtual.make_aligned(arena, []u8, size_of(String_Block) + string_block_sizes[size], align_of(String_Block))
+    block    = cast(^String_Block)raw_data(data)
+
+    block.len  = 0
+    block.cap  = string_block_sizes[size]
+    block.info = { size = size }
+    return block
+}
+
+string_block_new :: proc{
+    string_block_new_with_freelist,
+    string_block_new_without_freelist,
 }
 
 string_block_clone :: proc(arena: ^virtual.Arena, s: ^String_Block, free_list: ^String_Block_Free_List) -> (head, tail: ^String_Block) {
@@ -146,6 +161,20 @@ string_block_clone :: proc(arena: ^virtual.Arena, s: ^String_Block, free_list: ^
     return
 }
 
+string_block_clone_to_string :: proc(arena: ^virtual.Arena, block: ^String_Block) -> string {
+    sb: strings.Builder
+    strings.builder_init_none(&sb, virtual.arena_allocator(arena))
+
+    for current := block; current != nil; current = current.next {
+        #no_bounds_check {
+            strings.write_bytes(&sb, current.data[:current.len])
+        }
+    }
+
+    shrink(&sb.buf)
+    return strings.to_string(sb)
+}
+
 string_block_append :: proc(arena: ^virtual.Arena, a, b: ^String_Block, free_list: ^String_Block_Free_List) -> ^String_Block {
     head, tail := string_block_clone(arena, a, free_list)
     tail.next   = b
@@ -154,7 +183,7 @@ string_block_append :: proc(arena: ^virtual.Arena, a, b: ^String_Block, free_lis
 
 // Basics
 
-Context :: struct {
+Runtime_Context :: struct {
     things:       virtual.Arena,
     alive_things: int,
     total_things: int,
@@ -189,6 +218,11 @@ Thing_Type :: enum {
     Nil,
     T,
 
+    // only found in the constants table of a chunk
+    // NOTE: The indexes into the string table are per package, you must use the correct package to find the correct string
+    Constant_String,
+    Constant_Symbol,
+
     // Unused and free to use
     Dead,
 }
@@ -208,7 +242,17 @@ Thing_Function :: struct {
     env:    ^Thing,
 }
 
-Thing_Builtin :: #type proc(ctx: ^Context, root: ^Root, env: ^Thing, args: ^Thing) -> ^Thing
+Thing_Constant_String :: struct {
+    string: ^String_Block,
+    index:  int, // NOTE: Index into string table
+}
+
+Thing_Constant_Symbol :: struct {
+    symbol: ^Thing,
+    index:  int, // NOTE: Index into string table
+}
+
+Thing_Builtin :: #type proc(ctx: ^Runtime_Context, root: ^Root, env: ^Thing, args: ^Thing) -> ^Thing
 
 Thing_Env :: struct {
     parent: ^Thing,
@@ -216,14 +260,16 @@ Thing_Env :: struct {
 }
 
 Thing_Data :: struct #raw_union {
-    num:       i32,
-    str:       ^String_Block,
-    cons:      Thing_Cons,
-    symbol:    string,
-    function:  Thing_Function,
-    builtin:   Thing_Builtin,
-    env:       Thing_Env,
-    next_dead: ^Thing,
+    num:             i32,
+    str:             ^String_Block,
+    cons:            Thing_Cons,
+    symbol:          string,
+    function:        Thing_Function,
+    builtin:         Thing_Builtin,
+    env:             Thing_Env,
+    constant_string: Thing_Constant_String,
+    constant_symbol: Thing_Constant_Symbol,
+    next_dead:       ^Thing,
 }
 
 Thing :: struct {
@@ -236,7 +282,7 @@ Thing :: struct {
 
 // Alloc functions
 
-thing_new :: proc(ctx: ^Context, root: ^Root, type: Thing_Type) -> ^Thing {
+thing_new :: proc(ctx: ^Runtime_Context, root: ^Root, type: Thing_Type) -> ^Thing {
     if ctx.gc_things_threshold < ctx.alive_things {
         // run gc
         gc(ctx, root)
@@ -258,32 +304,32 @@ thing_new :: proc(ctx: ^Context, root: ^Root, type: Thing_Type) -> ^Thing {
     return thing
 }
 
-thing_num :: proc(ctx: ^Context, root: ^Root, num: i32) -> (thing: ^Thing) {
+thing_num :: proc(ctx: ^Runtime_Context, root: ^Root, num: i32) -> (thing: ^Thing) {
     thing     = thing_new(ctx, root, .Num)
     thing.num = num
     return thing
 }
 
-thing_string :: proc(ctx: ^Context, root: ^Root, block: ^String_Block) -> (thing: ^Thing) {
+thing_string :: proc(ctx: ^Runtime_Context, root: ^Root, block: ^String_Block) -> (thing: ^Thing) {
     thing     = thing_new(ctx, root, .String)
     thing.str = block
     return thing
 }
 
-thing_cons :: proc(ctx: ^Context, root: ^Root, car, cdr: ^Thing) -> (thing: ^Thing) {
+thing_cons :: proc(ctx: ^Runtime_Context, root: ^Root, car, cdr: ^Thing) -> (thing: ^Thing) {
     thing          = thing_new(ctx, root, .Cons)
     thing.cons.car = car
     thing.cons.cdr = cdr
     return thing
 }
 
-thing_symbol :: proc(ctx: ^Context, root: ^Root, name: string) -> (thing: ^Thing) {
+thing_symbol :: proc(ctx: ^Runtime_Context, root: ^Root, name: string) -> (thing: ^Thing) {
     thing        = thing_new(ctx, root, .Symbol)
     thing.symbol = strings.clone(name, virtual.arena_allocator(&ctx.strings))
     return
 }
 
-thing_symbol_intern :: proc(ctx: ^Context, root: ^Root, name: string) -> ^Thing {
+thing_symbol_intern :: proc(ctx: ^Runtime_Context, root: ^Root, name: string) -> ^Thing {
     root := root
 
     sym: ^Thing
@@ -298,7 +344,7 @@ thing_symbol_intern :: proc(ctx: ^Context, root: ^Root, name: string) -> ^Thing 
     return symbol.thing
 }
 
-thing_function :: proc(ctx: ^Context, root: ^Root, params, code, env: ^Thing, type: Thing_Type) -> (thing: ^Thing) {
+thing_function :: proc(ctx: ^Runtime_Context, root: ^Root, params, code, env: ^Thing, type: Thing_Type) -> (thing: ^Thing) {
     assert(type == .Function || type == .Macro)
 
     thing                 = thing_new(ctx, root, type)
@@ -308,26 +354,26 @@ thing_function :: proc(ctx: ^Context, root: ^Root, params, code, env: ^Thing, ty
     return
 }
 
-thing_builtin :: proc(ctx: ^Context, root: ^Root, builtin: Thing_Builtin) -> (thing: ^Thing) {
+thing_builtin :: proc(ctx: ^Runtime_Context, root: ^Root, builtin: Thing_Builtin) -> (thing: ^Thing) {
     thing         = thing_new(ctx, root, .Builtin)
     thing.builtin = builtin
     return
 }
 
-thing_env :: proc(ctx: ^Context, root: ^Root, parent: ^Thing, vars: ^Symbol_Map) -> (thing: ^Thing) {
+thing_env :: proc(ctx: ^Runtime_Context, root: ^Root, parent: ^Thing, vars: ^Symbol_Map) -> (thing: ^Thing) {
     thing     = thing_new(ctx, root, .Env)
     thing.env = { parent = parent, vars = vars }
     return
 }
 
-thing_kill :: proc(ctx: ^Context, thing: ^Thing) {
+thing_kill :: proc(ctx: ^Runtime_Context, thing: ^Thing) {
     thing.info.type   = .Dead
     thing.next_dead   = ctx.dead_things
     ctx.dead_things   = thing
     ctx.alive_things -= 1
 }
 
-thing_acons :: proc(ctx: ^Context, root: ^Root, x, y, a: ^Thing) -> ^Thing {
+thing_acons :: proc(ctx: ^Runtime_Context, root: ^Root, x, y, a: ^Thing) -> ^Thing {
     root := root
     cell: ^Thing
     root, _ = root_new_guard(root, &cell)
@@ -335,7 +381,7 @@ thing_acons :: proc(ctx: ^Context, root: ^Root, x, y, a: ^Thing) -> ^Thing {
     return thing_cons(ctx, root, cell, a)
 }
 
-thing_append :: proc(ctx: ^Context, root: ^Root, a, b: ^Thing) -> ^Thing {
+thing_append :: proc(ctx: ^Runtime_Context, root: ^Root, a, b: ^Thing) -> ^Thing {
     root := root
     head, tail, current: ^Thing
     root, _ = root_new_guard(root, &head, &tail, &current)
@@ -367,7 +413,7 @@ thing_append :: proc(ctx: ^Context, root: ^Root, a, b: ^Thing) -> ^Thing {
 
 // Printer
 
-print :: proc(ctx: ^Context, t: ^Thing) {
+print :: proc(ctx: ^Runtime_Context, t: ^Thing) {
     switch t.info.type {
     case .Num:
         fmt.print(t.num)
@@ -390,7 +436,7 @@ print :: proc(ctx: ^Context, t: ^Thing) {
         }
         if current != ctx.nil_ {
             fmt.print(" . ")
-            print(ctx, t.cons.cdr)
+            print(ctx, current)
         }
         fmt.print(")")
     case .Symbol:
@@ -407,6 +453,10 @@ print :: proc(ctx: ^Context, t: ^Thing) {
         fmt.print("nil")
     case .T:
         fmt.print("t")
+    case .Constant_String:
+        fmt.printf("<constant string %d>", t.constant_string.index)
+    case .Constant_Symbol:
+        fmt.printf("<constant symbol %d>", t.constant_symbol.index)
     case .Dead:
         fmt.print("<dead>")
     }

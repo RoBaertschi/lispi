@@ -2,6 +2,7 @@ package lispi
 
 import "base:runtime"
 
+import "core:log"
 import "core:slice"
 import "core:mem/virtual"
 
@@ -32,7 +33,7 @@ root_new_guard :: #force_inline proc(root: ^Root, vars: ..^^Thing, collisions :=
     return
 }
 
-gc_mark :: proc(ctx: ^Context, thing: ^Thing) {
+gc_mark :: proc(ctx: ^Runtime_Context, thing: ^Thing) {
     if thing == nil || thing.info.marked {
         return
     }
@@ -44,6 +45,8 @@ gc_mark :: proc(ctx: ^Context, thing: ^Thing) {
          .Nil,
          .T,
          .Builtin,
+         .Constant_String, // TODO(robin): are these correctly handled this way?
+         .Constant_Symbol,
          .Dead:
         break
 
@@ -62,7 +65,7 @@ gc_mark :: proc(ctx: ^Context, thing: ^Thing) {
     }
 }
 
-gc_mark_symbol_map :: proc(ctx: ^Context, m: ^Symbol_Map) {
+gc_mark_symbol_map :: proc(ctx: ^Runtime_Context, m: ^Symbol_Map) {
     if m.value.thing != nil {
         gc_mark(ctx, m.value.thing)
     }
@@ -74,13 +77,13 @@ gc_mark_symbol_map :: proc(ctx: ^Context, m: ^Symbol_Map) {
     }
 }
 
-gc_mark_string :: proc(ctx: ^Context, block: ^String_Block) {
+gc_mark_string :: proc(ctx: ^Runtime_Context, block: ^String_Block) {
     for element := block; element != nil; element = element.next {
         element.info.marked = true
     }
 }
 
-gc :: proc(ctx: ^Context, root: ^Root) {
+gc :: proc(ctx: ^Runtime_Context, root: ^Root) {
     when GC_DEBUG {
         log.debugf("Running gc on threshold %v", ctx.gc_things_threshold)
     }
@@ -135,7 +138,7 @@ gc :: proc(ctx: ^Context, root: ^Root) {
     }
 }
 
-gc_sweep_symbol_map :: proc(ctx: ^Context, m: ^Symbol_Map) -> (count: int) {
+gc_sweep_symbol_map :: proc(ctx: ^Runtime_Context, m: ^Symbol_Map) -> (count: int) {
     if m == nil {
         return
     }
@@ -158,7 +161,7 @@ gc_sweep_symbol_map :: proc(ctx: ^Context, m: ^Symbol_Map) -> (count: int) {
     return
 }
 
-gc_sweep_string :: proc(ctx: ^Context, block_ptr: ^^String_Block) {
+gc_sweep_string :: proc(ctx: ^Runtime_Context, block_ptr: ^^String_Block) {
     element, previous: ^String_Block = block_ptr^, nil
     for element != nil {
         next := element.next

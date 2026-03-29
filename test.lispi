@@ -1,2 +1,4 @@
-(deffun main
- (print "Hello World"))
+(package main)
+
+(deffun main ()
+ (progn (print "Hello World") (print "Hello World")))

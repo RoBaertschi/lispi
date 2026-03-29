@@ -28,7 +28,7 @@ Token :: struct {
 }
 
 Parser :: struct {
-    ctx:   ^Context,
+    ctx:   ^Compile_Context,
     input: string,
 
     ch_pos: int,
@@ -174,7 +174,7 @@ parser_next_token :: proc(parser: ^Parser) {
     parser.peek_token    = parser_read_token(parser)
 }
 
-parser_init :: proc(parser: ^Parser, ctx: ^Context, input: string) {
+parser_init :: proc(parser: ^Parser, ctx: ^Compile_Context, input: string) {
     parser.ctx   = ctx
     parser.input = input
     parser_read_ch(parser)
@@ -186,19 +186,16 @@ parser_destroy :: proc(parser: ^Parser) {
     parser^ = {}
 }
 
-parser_produce_internal :: proc(parser: ^Parser, root: ^Root, symbol: string) -> ^Thing {
-    root := root
-    list, sym: ^Thing
-    root, _ = root_new_guard(root, &list, &sym)
+parser_produce_internal :: proc(parser: ^Parser, symbol: string) -> ^Thing {
     parser_next_token(parser)
-    sym     = thing_symbol_intern(parser.ctx, root, symbol)
-    list    = parser_read(parser, root)
-    list    = thing_cons(parser.ctx, root, list, parser.ctx.nil_)
-    list    = thing_cons(parser.ctx, root, sym, list)
+    sym    := compile_thing_symbol_intern(parser.ctx, symbol)
+    list   := parser_read(parser)
+    list    = compile_thing_cons(parser.ctx, list, parser.ctx.nil_)
+    list    = compile_thing_cons(parser.ctx, sym, list)
     return list
 }
 
-parser_unqoute_string :: proc(parser: ^Parser, root: ^Root, token: Token) -> ^Thing {
+parser_unqoute_string :: proc(parser: ^Parser, token: Token) -> ^Thing {
     head, tail: ^String_Block
 
     largest := String_Block_Size.Small
@@ -208,11 +205,11 @@ parser_unqoute_string :: proc(parser: ^Parser, root: ^Root, token: Token) -> ^Th
 
     for i := 1; i < token.len - 1; i += 1 {
         if head == nil {
-            head = string_block_new(&parser.ctx.strings, largest, &parser.ctx.dead_string_blocks)
+            head = string_block_new(&parser.ctx.arena, largest)
             tail = head
         }
         if tail.len >= tail.cap {
-            tail.next = string_block_new(&parser.ctx.strings, largest, &parser.ctx.dead_string_blocks)
+            tail.next = string_block_new(&parser.ctx.arena, largest)
             tail      = tail.next
         }
 
@@ -251,11 +248,10 @@ parser_unqoute_string :: proc(parser: ^Parser, root: ^Root, token: Token) -> ^Th
     }
 
     parser_next_token(parser)
-    return thing_string(parser.ctx, root, head)
+    return compile_thing_string(parser.ctx, head)
 }
 
-parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
-    root := root
+parser_read :: proc(parser: ^Parser) -> ^Thing {
     simple: ^Thing
 
     token_string := parser.input[parser.current_token.pos:parser.current_token.pos + parser.current_token.len]
@@ -265,11 +261,11 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
         fatalf("Invalid token")
     case .EOF:
         fatalf("Invalid EOF")
-    case .String:   return parser_unqoute_string(parser, root, parser.current_token)
-    case .Quote:    return parser_produce_internal(parser, root, "quote")
-    case .Backtick: return parser_produce_internal(parser, root, "quasiquote")
-    case .Comma:    return parser_produce_internal(parser, root, "unquote")
-    case .Comma_At: return parser_produce_internal(parser, root, "unquote-splicing")
+    case .String:   return parser_unqoute_string(parser, parser.current_token)
+    case .Quote:    return parser_produce_internal(parser, "quote")
+    case .Backtick: return parser_produce_internal(parser, "quasiquote")
+    case .Comma:    return parser_produce_internal(parser, "unquote")
+    case .Comma_At: return parser_produce_internal(parser, "unquote-splicing")
     case .POpen:
         parser_next_token(parser)
         if parser.current_token.type == .PClose {
@@ -278,26 +274,25 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
         }
 
         start, head, current, t: ^Thing
-        root, _ = root_new_guard(root, &start, &head, &current, &t)
 
-        start = parser_read(parser, root)
+        start = parser_read(parser)
         if parser.current_token.type == .Dot {
             parser_next_token(parser)
-            head = parser_read(parser, root)
+            head = parser_read(parser)
             if parser.current_token.type != .PClose {
                 fatalf("Expected a ')' after a cons")
             }
             parser_next_token(parser)
-            start = thing_cons(parser.ctx, root, start, head)
+            start = compile_thing_cons(parser.ctx, start, head)
             return start
         }
 
-        head    = thing_cons(parser.ctx, root, start, parser.ctx.nil_)
+        head    = compile_thing_cons(parser.ctx, start, parser.ctx.nil_)
         current = head
 
         for parser.current_token.type != .PClose {
-            t                = parser_read(parser, root)
-            current.cons.cdr = thing_cons(parser.ctx, root, t, parser.ctx.nil_)
+            t                = parser_read(parser)
+            current.cons.cdr = compile_thing_cons(parser.ctx, t, parser.ctx.nil_)
             current          = current.cons.cdr
         }
         parser_next_token(parser)
@@ -305,7 +300,7 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
     case .PClose, .Dot:
         fatalf("Unexpected '%r'", rune(parser.ch))
     case .Symbol:
-        simple = thing_symbol_intern(parser.ctx, root, token_string)
+        simple = compile_thing_symbol_intern(parser.ctx, token_string)
     case .Num:
         val, ok := strconv.parse_int(token_string)
         if !ok {
@@ -315,7 +310,7 @@ parser_read :: proc(parser: ^Parser, root: ^Root) -> ^Thing {
         if  bits.I32_MAX < val || val < bits.I32_MIN {
             fatalf("Number (%d) does not fit into 32-bit number", val)
         }
-        simple = thing_num(parser.ctx, root, i32(val))
+        simple = compile_thing_num(parser.ctx, i32(val))
     }
 
     parser_next_token(parser)
