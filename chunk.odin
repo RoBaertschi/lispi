@@ -1,6 +1,5 @@
 package lispi
 
-import "core:container/xar"
 Opcode :: enum u8 {
     Load_Constant, // register(r), constant(c): register = LOAD_CONSTANT constant
     Load_Global,   // register(r), global(r):   register = LOAD_GLOBAL global

@@ -1,5 +1,6 @@
 package lispi
 
+import "core:math/bits"
 // Calling convention:
 //  proc(<todo>) -> (u8, bool)
 //  A call will put all variables into the first stack registers of the frame, started at 1 ..= <params count>
@@ -139,5 +140,10 @@ VM :: struct {
 }
 
 vm_load :: proc(c: ^Compiler) -> (vm: VM) {
-    vm.gc_things_threshold = 64
+    // Disabel gc for now
+    vm.gc_things_threshold = bits.INT_MAX
+    defer vm.gc_things_threshold = vm.alive_things
+
+
+    return
 }
